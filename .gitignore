@@ -1,0 +1,13 @@
+# 构建产物
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.log
+
+# 依赖（按 README 步骤拉取）
+third_party/imgui/
+
+# Python 缓存
+__pycache__/
+*.pyc
