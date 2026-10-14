@@ -498,6 +498,15 @@ static void jsb_esc(jsb* b, const char* s) {
 // ======================================================================
 // 手动补完静态导入（IAT snap）—— 原样保留 PEL_ref 实现
 // ======================================================================
+// 解析后的导入清单。**必须在 snap_imports 打补丁之前记下来**：
+// IAT 一旦被覆盖成真实地址，"名字在哪"这件事就永久丢失了。
+// 定义放在**最早的使用者（snap_imports）之前**——本文件里同一个顺序错误
+// 已经犯过两次（g_target_base、g_imps），所以这里显式写在 L505 之前。
+#define MAX_IMP 512
+static struct { char dll[64]; char name[128]; } g_imps[MAX_IMP];
+static int g_imps_n = 0;
+static int g_imps_truncated = 0;
+
 static int snap_imports(PVOID base) {
     logf("[*] snap_imports 进入 base=%p\n", base);
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
@@ -569,6 +578,24 @@ static int snap_imports(PVOID base) {
                 logf("[-] 导入解析失败: %s #%zu\n", dllName, i);
                 VirtualProtect(pageStart, pageLen, oldProt, &oldProt);
                 return -1;
+            }
+            // 记下 (dll, name)——**必须在这一行之前**，因为下一行就把 IAT 覆盖了。
+            if (g_imps_n < MAX_IMP) {
+                strncpy(g_imps[g_imps_n].dll, dllName, sizeof(g_imps[0].dll) - 1);
+                g_imps[g_imps_n].dll[sizeof(g_imps[0].dll) - 1] = 0;
+                if (IMAGE_SNAP_BY_ORDINAL64(ilt[i].u1.Ordinal)) {
+                    _snprintf_s(g_imps[g_imps_n].name, sizeof(g_imps[0].name), _TRUNCATE,
+                               "#%llu", (unsigned long long)IMAGE_ORDINAL64(ilt[i].u1.Ordinal));
+                } else {
+                    PIMAGE_IMPORT_BY_NAME rbn =
+                        (PIMAGE_IMPORT_BY_NAME)((BYTE*)base + ilt[i].u1.AddressOfData);
+                    strncpy(g_imps[g_imps_n].name, (const char*)rbn->Name,
+                                sizeof(g_imps[0].name) - 1);
+                    g_imps[g_imps_n].name[sizeof(g_imps[0].name) - 1] = 0;
+                }
+                g_imps_n++;
+            } else {
+                g_imps_truncated = 1;
             }
             ft[i].u1.Function = (ULONG_PTR)addr;
             snapped++;
@@ -1745,9 +1772,45 @@ static int list_modules(modinfo_t* out, int maxn) {
     return n;
 }
 
+// 主目标的映射基址。mod_find_by_name 用它把**空模块名**解析成主模块。
+// 原来是 main 里的局部变量，于是"默认模块"这个约定根本无法实现——
+// 而那正是 exports 用默认参数时一直返回"模块不存在"的原因。
+
+static PVOID g_target_base = NULL;
 static int mod_find_by_name(const char* name, modinfo_t* mi) {
     modinfo_t mods[128];
     int n = list_modules(mods, 128);
+    // 空名字 = 主模块。
+    //
+    // 原来空名字**匹配不到任何东西**：第一条比较是 _stricmp(name, "")，
+    // 第二条要求 strlen(name) == blen，而 strlen("") 恒为 0、模块名的
+    // basename 长度恒大于 0。所以两个条件都永远为假。
+    //
+    // 后果：`exports` 用默认参数（module 省略）时**从来就没工作过**，
+    // 一直返回"模块不存在"；而新加的 `list_imports` 继承了同一个毛病。
+    // 而调用方看到的错误是"模块不存在"——听起来像调用方给错了名字，
+    // 不像"空名字这个约定根本没实现"。
+    //
+    // 判据：空名字返回主模块（基址等于目标基址的那个）。
+    if (name && !*name) {
+        for (int i = 0; i < n; i++) {
+            if (g_target_base && mods[i].base == (ULONG_PTR)g_target_base) {
+                if (mi) *mi = mods[i];
+                return 1;
+            }
+        }
+        // 退路：主可执行文件是唯一以 .exe 结尾且不是调试器自身的那个；
+        // 找不到就取第一个，总比返回"不存在"有用。
+        for (int i = 0; i < n; i++) {
+            size_t l = strlen(mods[i].name);
+            if (l > 4 && _stricmp(mods[i].name + l - 4, ".exe") == 0) {
+                if (mi) *mi = mods[i];
+                return 1;
+            }
+        }
+        if (n > 0) { if (mi) *mi = mods[0]; return 1; }
+        return 0;
+    }
     for (int i = 0; i < n; i++) {
         if (_stricmp(mods[i].name, name) == 0) { if (mi) *mi = mods[i]; return 1; }
         // 允许不带 .dll/.exe 后缀匹配
@@ -3514,6 +3577,31 @@ static jval* cmd_dispatch(const char* cmd, jval* args, jval* result) {
         }
         jv_put(result, "exports", arr);
     }
+    else if (!strcmp(cmd, "list_imports")) {
+        // 倾倒 snap_imports 在打补丁之前记下的清单。
+        //
+        // **不要在这里重新遍历导入表。** 第一版就是这么做的，理由是
+        // "不新增状态更安全"，而那个判断是错的：这个引擎的加载路径是
+        // LoadLibraryExW(DONT_RESOLVE_DLL_REFERENCES) 加上 snap_imports
+        // **手工覆盖 IAT**，而 Sky.exe 的 OriginalFirstThunk 恰好为 0，
+        // 于是只能回退去读那个已被覆盖的 IAT——里面的值全是真实地址、
+        // 永远不为 0，遍历失控，引擎访问违例崩溃。
+        // **当既有状态是破坏性的时候，"不新增状态"并不更安全。**
+        //
+        // 顺带：这也说明返回值必须能区分"没有导入"和"读不到"，
+        // 所以同时报 captured 与 truncated。
+        jval* arr = jv_new(4);
+        for (int i = 0; i < g_imps_n; i++) {
+            jval* e = jv_new(5);
+            jv_put(e, "dll", jv_str(g_imps[i].dll));
+            jv_put(e, "name", jv_str(g_imps[i].name));
+            jv_add(arr, e);
+        }
+        jv_put(result, "imports", arr);
+        jv_put(result, "count", jv_num((double)g_imps_n));
+        jv_put(result, "captured", jv_bool(g_imps_n > 0 ? 1 : 0));
+        jv_put(result, "truncated", jv_bool(g_imps_truncated));
+    }
     else if (!strcmp(cmd, "read_stack")) {
         unsigned long long count = jv_numval(args, "count", 32);
         if (count > 512) count = 512;
@@ -4100,6 +4188,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     PVOID target_base = (PVOID)hTarget;
+    g_target_base = target_base;
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)target_base;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)target_base + dos->e_lfanew);
     PVOID ep = (PVOID)((BYTE*)target_base + nt->OptionalHeader.AddressOfEntryPoint);
