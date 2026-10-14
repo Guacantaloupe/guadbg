@@ -2466,6 +2466,18 @@ static int pause_here(PEXCEPTION_POINTERS ep, DWORD tid, const char* reason) {
     ResetEvent(g_go);
     int cmd = (int)InterlockedExchange(&g_cmd, CMD_NONE);
     InterlockedExchange(&g_state, DS_RUN);
+    // 恢复时必须**清空 reason**，否则 get_state 会自相矛盾。
+    //
+    // 不清的后果是实测到的：断点还没命中时查询，得到
+    //     {"state":"running", "reason":"断点 #2 @ 0x7ffdd9da1444"}
+    // ——两个字段互相打架，而调用方无法判断哪个是真的。
+    // smoke_test.py 因此以约 17% 的概率失败（10 次里 1~2 次），
+    // 而失败信息表现为"断点命中暂停"这一项不通过，
+    // 看起来像断点没命中，实际是**上一次**的原因字符串还挂在那里。
+    //
+    // 判据：暂停期间 reason 有意义；一旦 g_state 不再是 DS_PAUSE，
+    // reason 必须为空串。这样两个字段永远不冲突。
+    g_pause_reason[0] = '\0';
     g_pctx = NULL;
     evt_resumed();
     return cmd;

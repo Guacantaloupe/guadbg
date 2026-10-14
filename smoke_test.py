@@ -33,6 +33,27 @@ def check(name, cond, extra=""):
     if not cond:
         fails.append(name)
 
+def wait_state(want, timeout=8.0, poll=0.05):
+    """轮询直到 state == want，返回最后一次的状态字典。
+
+    为什么需要它：原来这里用固定的 time.sleep(1) / time.sleep(0.5)，
+    然后直接断言状态。而"断点何时命中"取决于被调试进程跑得快不快——
+    在负载高的时候 1 秒不够，于是断言失败。实测失败率约 17%（10 次里 1~2 次），
+    而失败信息是"断点命中暂停"不通过，看起来像断点没命中。
+
+    **一个依赖竞态的测试不是测试**：它会把"这次机器慢"报成"功能坏了"。
+    轮询把判据从"猜一个时间"换成"在超时内等到它"。
+    """
+    import time as _t
+    end = _t.time() + timeout
+    st = {}
+    while _t.time() < end:
+        st = call("get_state").get("result", {})
+        if st.get("state") == want:
+            return st
+        _t.sleep(poll)
+    return st
+
 eng = subprocess.Popen([ROOT + r"\guadbg.exe", ROOT + r"\test_target.exe"],
                        stdout=open(ROOT + r"\smoke_engine.log", "w"),
                        stderr=subprocess.STDOUT)
@@ -106,16 +127,14 @@ try:
     bid = bp.get("id", 0)
     check("断点已建", bid > 0, bp)
     call("resume")
-    time.sleep(1)
-    st = call("get_state").get("result", {})
+    st = wait_state("paused", timeout=8.0)
     check("断点命中暂停", st.get("state") == "paused", st)
     check("命中地址正确", st.get("rip") == loop_rip, f"{hex(st.get('rip',0))} != {hex(loop_rip)}")
     call("del_bp", {"id": bid})
 
     print("[9] resume + pause")
     call("resume")
-    time.sleep(0.5)
-    st = call("get_state").get("result", {})
+    st = wait_state("running", timeout=3.0)
     check("恢复运行", st.get("state") == "running", st)
     call("pause")
     st = call("get_state").get("result", {})
@@ -135,8 +154,7 @@ try:
     hw = call("set_hw_bp", {"addr": st.get("rip", 0), "size": 1, "mode": "exec"}).get("result", {})
     check("硬件断点已建", hw.get("id", 0) > 0, hw)
     call("resume")
-    time.sleep(1)
-    st = call("get_state").get("result", {})
+    st = wait_state("paused", timeout=8.0)
     check("硬件断点命中暂停", st.get("state") == "paused", st)
     call("del_bp", {"id": hw.get("id", 0)})
 
