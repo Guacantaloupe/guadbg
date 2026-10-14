@@ -34,6 +34,9 @@
 #include <string.h>
 #include <wchar.h>
 #include <stdarg.h>
+#include <vector>
+#include <string>
+#include <cstdint>
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "psapi.lib")
@@ -65,6 +68,30 @@ typedef struct _X_LDR_DATA_TABLE_ENTRY {
     ULONG SizeOfImage;
     X_UNICODE_STRING FullDllName;
     X_UNICODE_STRING BaseDllName;
+    // 下面这些字段在真实结构里也是存在的，而这个结构原先到此为止。
+    //
+    // 后果是实测的：只分配到 BaseDllName 就把条目插进链表，ntdll 走到它之后会读
+    // `[rax+0x38]` 并与 9 比较——那是一条链表遍历里的版本/类型检查，而 rax 是
+    // 从**未定义字段**里取出来的零。异常记录里 info2 = 0x38 正是这一点的直接证据：
+    // 出错地址等于 0x38 说明基址寄存器是 0，指令读的就是 [0+0x38]。
+    //
+    // HashLinks 尤其要紧：ntdll 的按名查找会顺着它走，全零等于把一个 NULL 交给遍历。
+    // 未使用的 LIST_ENTRY 必须是**自指的空链表**，不是零。
+    ULONG Flags;
+    ULONG LoadCount;
+    ULONG TlsIndex;
+    LIST_ENTRY HashLinks;
+    PVOID SectionPointer;
+    ULONG CheckSum;
+    ULONG TimeDateStamp;
+    PVOID EntryPointActivationContext;
+    PVOID PatchInformation;
+    LIST_ENTRY ForwarderLinks;
+    LIST_ENTRY ServiceTagLinks;
+    LIST_ENTRY StaticLinks;
+    PVOID ContextInformation;
+    ULONG_PTR OriginalBase;
+    LARGE_INTEGER LoadTime;
 } X_LDR_DATA_TABLE_ENTRY;
 
 typedef struct _X_PEB_LDR_DATA {
@@ -84,6 +111,156 @@ typedef struct _X_PEB {
 } X_PEB;
 
 static X_PEB* x_peb(void) { return (X_PEB*)__readgsqword(0x60); }
+
+// ======================================================================
+// 手动映射目标映像（不运行入口点，按段属性设置保护）
+// ======================================================================
+static void logf(const char* fmt, ...);   // 定义在下面，映射器要先用到
+//
+// 为什么必须自己映射，而不是找一个系统 API：
+//
+//   LoadLibraryW 会把 EXE 的入口点当 DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL) 调用，
+//   于是目标自己的启动代码在**装载期间**就跑起来，而那一刻 PEB 还在描述引擎。
+//   在 Sky.exe 上实测：0xC0000005 @ 0x7ffdd9da6df0（ntdll 内），两次运行地址完全相同。
+//
+//   LoadLibraryExW(..., LOAD_LIBRARY_AS_IMAGE_RESOURCE) 不调用入口点，这是对的，
+//   但它**把所有段映射成只读**，于是一个想写自己 .data 的程序立刻访问违例——
+//   这是实测的：换成它之后 test_target.exe 在系统地址上抛 0xC0000005，
+//   而模块列表里也找不到它，因为这种映射不是一次真正的模块装载。
+//
+//   所以这里自己做：按映像头分配、逐段拷贝、按段特性设置页保护、按需重定位。
+//   「不运行入口点」这个要求排除了所有现成 API，只能自己来。
+static PVOID map_image_manually(const WCHAR* path, PVOID* out_ep, ULONG* out_size) {
+    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        logf("[-] 打不开映像: %lu\n", GetLastError());
+        return NULL;
+    }
+    LARGE_INTEGER fileSize{};
+    GetFileSizeEx(hFile, &fileSize);
+    std::vector<BYTE> raw(static_cast<std::size_t>(fileSize.QuadPart));
+    DWORD got = 0;
+    const BOOL readOk = ReadFile(hFile, raw.data(), static_cast<DWORD>(raw.size()), &got, NULL);
+    CloseHandle(hFile);
+    if (!readOk || got != raw.size()) {
+        logf("[-] 读映像失败 (%lu, %lu/%zu)\n", GetLastError(), got, raw.size());
+        return NULL;
+    }
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)raw.data();
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(raw.data() + dos->e_lfanew);
+    const ULONG sizeOfImage = nt->OptionalHeader.SizeOfImage;
+    PVOID preferred = (PVOID)(ULONG_PTR)nt->OptionalHeader.ImageBase;
+
+    // 先试首选基址。映像里所有绝对地址都按这个基址写死，落在别处就要处理重定位；
+    // 而 Sky.exe 只有 3 条重定位，说明它基本是按固定基址构建的。
+    PVOID base = VirtualAlloc(preferred, sizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    bool relocated = false;
+    if (!base) {
+        base = VirtualAlloc(NULL, sizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        relocated = true;
+        logf("[!] 首选基址 %p 不可用，改在 %p 映射（需要重定位）\n", preferred, base);
+    }
+    if (!base) {
+        logf("[-] VirtualAlloc(%lu) 失败 %lu\n", sizeOfImage, GetLastError());
+        return NULL;
+    }
+
+    // 头 + 段。按 VirtualSize 清零、按 SizeOfRawData 拷贝，两者不等时以小的为准，
+    // 这是装载器对未初始化数据的处理方式。
+    memcpy(base, raw.data(), nt->OptionalHeader.SizeOfHeaders);
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (sec->SizeOfRawData == 0 || sec->VirtualAddress == 0) continue;
+        BYTE* dst = (BYTE*)base + sec->VirtualAddress;
+        const std::size_t copy = (sec->SizeOfRawData < sec->Misc.VirtualSize)
+                                     ? sec->SizeOfRawData
+                                     : sec->Misc.VirtualSize;
+        if (copy) memcpy(dst, raw.data() + sec->PointerToRawData, copy);
+    }
+
+    // 重定位。只有在没拿到首选基址时才需要，但代码照写——一个不肯处理它的映射器
+    // 会在基址被占用的机器上产生一堆无法解释的崩溃。
+    if (relocated) {
+        const auto delta = (ULONG_PTR)base - nt->OptionalHeader.ImageBase;
+        const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        std::size_t applied = 0;
+        if (dir.VirtualAddress && dir.Size) {
+            BYTE* p = (BYTE*)base + dir.VirtualAddress;
+            BYTE* end = p + dir.Size;
+            while (p + sizeof(IMAGE_BASE_RELOCATION) <= end) {
+                PIMAGE_BASE_RELOCATION block = (PIMAGE_BASE_RELOCATION)p;
+                if (block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION)) break;
+                const std::size_t count = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2;
+                WORD* entries = (WORD*)(block + 1);
+                for (std::size_t k = 0; k < count; ++k) {
+                    const WORD type = entries[k] >> 12;
+                    const WORD off = entries[k] & 0xFFF;
+                    BYTE* target = (BYTE*)base + block->VirtualAddress + off;
+                    if (type == IMAGE_REL_BASED_DIR64) {
+                        *(ULONG_PTR*)target += delta;
+                        ++applied;
+                    } else if (type == IMAGE_REL_BASED_HIGHLOW) {
+                        *(ULONG*)target += (ULONG)delta;
+                        ++applied;
+                    } else if (type == IMAGE_REL_BASED_ABSOLUTE) {
+                        // padding
+                    } else {
+                        logf("[!] 未处理的基址重定位类型 %u\n", type);
+                    }
+                }
+                p += block->SizeOfBlock;
+            }
+        }
+        logf("[*] 已应用基址重定位: %zu 条\n", applied);
+    }
+
+    // 段保护。这一步是 LOAD_LIBRARY_AS_IMAGE_RESOURCE 缺的那一步，也是它不可用的原因：
+    // 一个想写自己 .data 的程序在只读映射上立刻违例。
+    sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        DWORD prot = PAGE_READONLY;
+        const DWORD ch = sec->Characteristics;
+        const bool x = (ch & IMAGE_SCN_MEM_EXECUTE) != 0;
+        const bool r = (ch & IMAGE_SCN_MEM_READ) != 0;
+        const bool w = (ch & IMAGE_SCN_MEM_WRITE) != 0;
+        if (x && w) prot = PAGE_EXECUTE_READWRITE;
+        else if (x) prot = r ? PAGE_EXECUTE_READ : PAGE_EXECUTE;
+        else if (w) prot = PAGE_READWRITE;
+        else if (r) prot = PAGE_READONLY;
+        else prot = PAGE_NOACCESS;
+        DWORD old = 0;
+        VirtualProtect((BYTE*)base + sec->VirtualAddress,
+                       sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData,
+                       prot, &old);
+    }
+
+    *out_ep = (PVOID)((BYTE*)base + nt->OptionalHeader.AddressOfEntryPoint);
+    *out_size = sizeOfImage;
+
+    // 注册异常表。手动映射的映像不在加载器的表里，`.pdata` 因此对系统不可见，
+    // 而 x64 的异常展开、`__C_specific_handler`、以及 CRT 的部分启动路径都依赖它。
+    // 不注册的后果不是"异常处理差一点"，而是目标一进自己的代码就可能炸在 ntdll 里——
+    // 这是实测：寄生线程跳到入口点之后立刻 0xC0000005 @ ntdll，info2 = 0xffffffffffffffff。
+    {
+        const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (dir.VirtualAddress && dir.Size) {
+            const ULONG count = dir.Size / sizeof(RUNTIME_FUNCTION);
+            auto* table = (RUNTIME_FUNCTION*)((BYTE*)base + dir.VirtualAddress);
+            // 函数表里 BeginAddress/EndAddress 是 RVA；RtlAddFunctionTable 期望的就是这种形式。
+            if (RtlAddFunctionTable(table, count, (DWORD64)base)) {
+                logf("[*] 已注册异常表: %lu 个函数条目\n", count);
+            } else {
+                logf("[!] RtlAddFunctionTable 失败 (%lu)，异常展开可能不正确\n", GetLastError());
+            }
+        }
+    }
+
+    logf("[*] 手动映射完成: base=%p size=0x%lx ep=%p（入口点尚未运行）\n",
+         base, sizeOfImage, *out_ep);
+    return base;
+}
 
 // ======================================================================
 // 日志
@@ -322,22 +499,51 @@ static void jsb_esc(jsb* b, const char* s) {
 // 手动补完静态导入（IAT snap）—— 原样保留 PEL_ref 实现
 // ======================================================================
 static int snap_imports(PVOID base) {
+    logf("[*] snap_imports 进入 base=%p\n", base);
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)base + dos->e_lfanew);
     ULONG impRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    logf("[*]   导入目录 RVA=0x%lx\n", impRva);
     if (!impRva) return 0;
     PIMAGE_IMPORT_DESCRIPTOR desc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)base + impRva);
     int snapped = 0;
+    int ndesc = 0;
     for (; desc->Name; desc++) {
+        // 每个描述符都记录，包括 Name 的读取本身——若故障发生在读取 desc->Name 上，
+        // 那么连这行都不会出现，这本身就是定位信息。
+        ++ndesc;
+        logf("[*]   描述符 %d: Name RVA=0x%lx\n", ndesc, (unsigned long)desc->Name);
         char* dllName = (char*)((BYTE*)base + desc->Name);
         WCHAR wname[64];
         MultiByteToWideChar(CP_ACP, 0, dllName, -1, wname, 64);
         HMODULE hdll = GetModuleHandleW(wname);
-        if (!hdll) hdll = LoadLibraryA(dllName);
+        if (!hdll) {
+            // 逐个记录。这里会**运行依赖 DLL 自己的 DllMain**——那是装载它们不可避免的一部分，
+            // 而 Sky.exe 的依赖里有 fmod、fmodstudio、steam_api64、vulkan-1、igvk64，
+            // 其中任何一个的初始化都可能失败。没有这行日志，一次失败只表现为
+            // "在导入补完之前崩了"，看不出是哪一个。
+            logf("[*] 加载依赖: %s\n", dllName);
+            hdll = LoadLibraryA(dllName);
+            logf("[*]   已加载: %s -> %p\n", dllName, (void*)hdll);
+        }
         if (!hdll) { logf("[-] 导入模块缺失: %s\n", dllName); return -1; }
 
-        PIMAGE_THUNK_DATA64 ilt = (PIMAGE_THUNK_DATA64)((BYTE*)base + desc->OriginalFirstThunk);
         PIMAGE_THUNK_DATA64 ft = (PIMAGE_THUNK_DATA64)((BYTE*)base + desc->FirstThunk);
+        // OriginalFirstThunk 为 0 表示"没有单独的导入名表，名字在 FirstThunk 里"，
+        // 而 `desc->FirstThunk` 此时是 IAT 的 RVA，那里的值就是指向 IMAGE_IMPORT_BY_NAME 的。
+        //
+        // 判断必须看 **RVA 是不是 0**，不能看指针是不是 NULL：
+        //   `(BYTE*)base + 0` 是一个**非空**指针，所以 `if (!ilt)` 永远不成立，
+        //   于是循环从映像基址（MZ 头）开始，把整个映像当作 thunk 数组一路走下去，
+        //   直到越过页边界触发访问违例。
+        //
+        // 这个 bug 只在 OriginalFirstThunk 为 0 的映像上发作，而 Sky.exe 正是如此——
+        // 它的导入表是「27 项、每个 DLL 一条、OriginalFirstThunk == 0、名字在 FirstThunk」，
+        // 这是本项目静态分析早就记录过的事实。实测表现：引擎在第一个描述符上崩在 ntdll 内
+        // 0x7ffdd9da6df0，与最初 LoadLibraryW 崩溃的地址完全相同。
+        PIMAGE_THUNK_DATA64 ilt =
+            desc->OriginalFirstThunk ? (PIMAGE_THUNK_DATA64)((BYTE*)base + desc->OriginalFirstThunk)
+                                     : ft;
         SIZE_T span = 0;
         if (!ilt) { ilt = ft; }
         for (PIMAGE_THUNK_DATA64 t = ilt; t->u1.AddressOfData; t++) span++;
@@ -2141,10 +2347,17 @@ static void resume_all(void) {
 static void hw_apply_all(void) {
     DWORD tids[SUSMAX];
     int n = snapshot_threads(tids, SUSMAX);
+    // 逐线程记录。这里在 Sky.exe 上会挂住而在单线程目标上不会，所以需要知道停在哪一个上：
+    // suspend_all 的注释已经指出引擎线程被挂起会永久死锁，而这段代码同样的风险在于
+    // SuspendThread 的目标线程此刻可能正持有某个锁。没有这行日志，一次挂起只表现为
+    // "set_hw_bp 不返回"，看不出是哪个线程、停在哪一步。
+    logf("[*] hw_apply_all: %d 个线程\n", n);
     for (int i = 0; i < n; i++) {
         if (eng_tid_is(tids[i])) continue;   // 引擎线程不设 Dr（也避免与引擎锁交互）
+        logf("[*]   tid %lu: OpenThread\n", (unsigned long)tids[i]);
         HANDLE h = OpenThread(THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, tids[i]);
-        if (!h) continue;
+        if (!h) { logf("[*]   tid %lu: 打不开\n", (unsigned long)tids[i]); continue; }
+        logf("[*]   tid %lu: SuspendThread\n", (unsigned long)tids[i]);
         SuspendThread(h);
         CONTEXT c;
         memset(&c, 0, sizeof(c));
@@ -2177,7 +2390,9 @@ static void hw_apply_all(void) {
         }
         ResumeThread(h);
         CloseHandle(h);
+        logf("[*]   tid %lu: 完成\n", (unsigned long)tids[i]);
     }
+    logf("[*] hw_apply_all: 结束\n");
 }
 
 // guard page 内存断点重保护队列
@@ -2607,8 +2822,19 @@ static LONG NTAPI gua_veh(PEXCEPTION_POINTERS ep) {
             free(b.p);
         }
         int cmd2 = pause_here(ep, tid, reason);
-        (void)cmd2;   // 恢复即 EXCEPTION_CONTINUE_EXECUTION（对 AV 等同二次机会）
-        return EXCEPTION_CONTINUE_EXECUTION;
+        (void)cmd2;
+        // 致命异常在恢复之后必须**继续传播**，不能 CONTINUE_EXECUTION。
+        //
+        // CONTINUE_EXECUTION 的语义是"重试引起异常的那条指令"。对一次未修复的访问违例，
+        // 重试必然立刻再违例，于是 VEH 陷入 暂停→恢复→再违例 的循环。这是实测的：日志里
+        // info2 每次运行都不同（0xffffffffffffffff、0x38、0x240785a4f），正是一次次全新故障的痕迹。
+        //
+        // 而暂停本身在这里也是有害的：寄生线程在 VEH 里等待 g_go，而管道线程没能把命令送到，
+        // 于是引擎活着、CPU 为 0、却不再回答任何查询——这正是实测到的状态。
+        //
+        // 所以对未处理的致命异常：记录位置、广播事件、然后**直接放行**。停下也检查不出更多
+        // 东西——位置已经写进日志了——而停下会让整台引擎不可用，那才是真正的代价。
+        return EXCEPTION_CONTINUE_SEARCH;
     }
     }
 }
@@ -2945,8 +3171,61 @@ static jval* cmd_dispatch(const char* cmd, jval* args, jval* result) {
         }
         jv_put(result, "lines", arr);
     }
-    else if (!strcmp(cmd, "list_threads")) {
-        DWORD tids[256];
+    else if (!strcmp(cmd, "windows")) {
+        // 列出本进程的顶层窗口。
+        //
+        // 为什么这个命令值得单独加：实测 Sky.exe 在引擎里"跑起来了"却停住——
+        // 55 个模块里 40 个是它自己加载的（媒体、存储、网络、UI 栈都初始化了），
+        // 但 vulkan-1.dll 从未加载，CPU 只有 0.1 秒，入口点线程停在 win32u.dll 的
+        // 窗口内部函数上。那个组合的特征是**一个模态对话框的消息泵在等**，
+        // 而对话框的标题和文本会直接说出真正的原因。
+        //
+        // 引擎与目标在**同一个进程**里（寄生线程架构），所以 EnumWindows 直接就能看到，
+        // 不需要跨进程读取，也就**不碰目标一个字节**——vulkan-1.dll 的完整性校验不受影响。
+        struct WinRow { HWND hwnd; DWORD tid; };
+        static WinRow g_win_rows[256];
+        static int g_win_n;
+        g_win_n = 0;
+        EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != GetCurrentProcessId()) return TRUE;      // 只看本进程的
+            if (g_win_n < 256) {
+                g_win_rows[g_win_n].hwnd = hwnd;
+                g_win_rows[g_win_n].tid = GetWindowThreadProcessId(hwnd, NULL);
+                ++g_win_n;
+            }
+            return TRUE;
+        }, 0);
+
+        jval* arr = jv_new(4);
+        for (int i = 0; i < g_win_n; i++) {
+            HWND hwnd = g_win_rows[i].hwnd;
+            jval* e = jv_new(5);   // 5 = 对象（0 null / 1 bool / 2 num / 3 str / 4 arr / 5 obj）
+            jv_put(e, "hwnd", jv_num((double)(ULONG_PTR)hwnd));
+            jv_put(e, "tid", jv_num((double)g_win_rows[i].tid));
+            char cls[256] = {0}, txt[512] = {0};
+            GetClassNameA(hwnd, cls, sizeof(cls));
+            WCHAR wtxt[512] = {0};
+            int wlen = GetWindowTextW(hwnd, wtxt, 511);
+            if (wlen > 0) WideCharToMultiByte(CP_UTF8, 0, wtxt, -1, txt, sizeof(txt), NULL, NULL);
+            jv_put(e, "class", jv_str(cls));
+            jv_put(e, "title", jv_str(txt));
+            jv_put(e, "visible", jv_bool(IsWindowVisible(hwnd) != 0));
+            jv_put(e, "enabled", jv_bool(IsWindowEnabled(hwnd) != 0));
+            // 模态判断：对话框自己启用、而它的属主被禁用——那正是模态框的形状。
+            HWND owner = GetWindow(hwnd, GW_OWNER);
+            jv_put(e, "has_owner", jv_bool(owner != NULL));
+            jv_put(e, "owner_enabled", jv_bool(owner ? (IsWindowEnabled(owner) != 0) : true));
+            RECT rc = {0,0,0,0};
+            GetWindowRect(hwnd, &rc);
+            jv_put(e, "rect", jv_num((double)rc.left * 1e6 + (double)rc.top));
+            jv_add(arr, e);
+        }
+        jv_put(result, "windows", arr);
+        jv_put(result, "count", jv_num((double)g_win_n));
+    }
+    else if (!strcmp(cmd, "list_threads")) {        DWORD tids[256];
         int n = snapshot_threads(tids, 256);
         jval* arr = jv_new(4);
         for (int i = 0; i < n; i++) {
@@ -3058,13 +3337,18 @@ static jval* cmd_dispatch(const char* cmd, jval* args, jval* result) {
         jv_put(result, "addr", jv_num((double)u));
     }
     else if (!strcmp(cmd, "set_hw_bp")) {
+        // 这段在 Sky.exe 上会挂住（入口点处于断点暂停状态时），而在单线程目标上不会。
+        // 日志用来区分三种可能：命令根本没到、卡在 g_bp_lock 上、还是卡在 hw_apply_all 里。
+        logf("[*] set_hw_bp: 进入\n");
         u = jv_numval(args, "addr", 0);
         unsigned long long sz = jv_numval(args, "size", 8);
         const char* mode = jv_strval(args, "mode", "exec");
         if (!u) { jv_put(result, "error", jv_str("缺少 addr")); return result; }
         if (sz != 1 && sz != 2 && sz != 4 && sz != 8) sz = 8;
         int hwcount = 0;
+        logf("[*] set_hw_bp: 取 g_bp_lock\n");
         EnterCriticalSection(&g_bp_lock);
+        logf("[*] set_hw_bp: 已取到锁\n");
         for (int i = 0; i < MAX_BP; i++)
             if (g_bps[i].used && g_bps[i].type == BP_HW) hwcount++;
         if (hwcount >= 4) { LeaveCriticalSection(&g_bp_lock); jv_put(result, "error", jv_str("硬件断点槽已满(4)")); return result; }
@@ -3581,7 +3865,31 @@ static DWORD WINAPI pipe_client_thread(PVOID arg) {
         if (!ReadFile(h, buf, sizeof(buf) - 1, &r, NULL) || r == 0) break;
         buf[r] = 0;
         jval* req = json_parse(buf);
-        if (!req) continue;
+        if (!req) {
+            // 解析失败必须**回一个错误**，不能静默丢弃。
+            //
+            // 原来的 `continue` 让调用者永久等下去：实测中一次引号被 shell 吃掉的参数
+            // （`{addr:...,mode:exec}` 而不是 `{"addr":...,"mode":"exec"}`）表现成
+            // "set_hw_bp 挂死"，而引擎其实健康——get_state 照常返回。
+            // 一个不回应的失败看起来像死锁，而它其实是一句话就能说清的错误。
+            char errbuf[512];
+            int shown = r > 200 ? 200 : (int)r;
+            sprintf_s(errbuf, "请求不是合法 JSON（收到 %lu 字节，前 %d 字节：%.*s）",
+                (unsigned long)r, shown, shown, buf);
+            jsb eb; jsb_init(&eb);
+            jsb_put(&eb, "{\"id\":0,\"ok\":false,\"error\":");
+            jsb_put(&eb, "\"");
+            for (const char* q = errbuf; *q; ++q) {
+                if (*q == '"' || *q == '\\') jsb_put(&eb, "\\");
+                if ((unsigned char)*q < 0x20) jsb_put(&eb, " ");
+                else { char one[2] = { *q, 0 }; jsb_put(&eb, one); }
+            }
+            jsb_put(&eb, "\"}\n");
+            DWORD wrote = 0;
+            WriteFile(h, eb.p, (DWORD)eb.len, &wrote, NULL);
+            free(eb.p);
+            continue;
+        }
         jval* jcmd = jv_get(req, "cmd");
         jval* jargs = jv_get(req, "args");
         jval* jid = jv_get(req, "id");
@@ -3753,36 +4061,140 @@ int main(int argc, char** argv) {
     // ---- 引擎先行初始化（VEH/管道），以便目标入口前即可下断 ----
     engine_init();
 
-    // ---- 1. 系统加载器正式装载目标 ----
-    HMODULE hTarget = LoadLibraryW(g_target_path);
-    if (!hTarget) { logf("[-] LoadLibrary 失败 %lu\n", GetLastError()); return 1; }
+    // ---- 1. 让真正的加载器映射映像，但不解析导入、也不运行入口点 ----
+    //
+    // 三条路都试过了，都是实测：
+    //
+    //   LoadLibraryW
+    //       入口点被当 DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL) 调用，而那一刻 PEB 还在
+    //       描述引擎自己 —— Sky.exe 上崩在 ntdll 的偏移 0x166df0。
+    //
+    //   LOAD_LIBRARY_AS_IMAGE_RESOURCE
+    //       不跑入口点，但**所有段映射成只读**（写自己 .data 的程序立刻违例），
+    //       而且**不进 Ldr 列表** —— 那不是一次真正的模块装载。
+    //
+    //   手工映射 + 自己造 Ldr 条目
+    //       不跑入口点、段保护也对，但**伪造的条目过不了加载器自己的遍历**：
+    //       ntdll 在 0x180010849 处 `mov 0x98(%rdi),%rax` 之后**无判空**地
+    //       `cmp dword ptr [rax+0x38], 9`，期望那个字段是真实装载填好的；伪造条目给 0，
+    //       于是解引用 0x38 —— 异常记录里的 **info2 = 0x38** 正是这一点的直接证据。
+    //
+    // DONT_RESOLVE_DLL_REFERENCES 把前两条的长处合起来：它是**真正的模块装载**
+    // （加载器建条目、按段特性设保护、进三个链表），但**不解析导入、不调用入口点**。
+    // 导入由 snap_imports 自己补 —— 那本来就是这个引擎已经在做的事。
+    HMODULE hTarget = LoadLibraryExW(g_target_path, NULL, DONT_RESOLVE_DLL_REFERENCES);
+    if (!hTarget) {
+        logf("[-] LoadLibraryEx(DONT_RESOLVE_DLL_REFERENCES) 失败 %lu\n", GetLastError());
+        return 1;
+    }
     PVOID target_base = (PVOID)hTarget;
-    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)target_base + ((PIMAGE_DOS_HEADER)target_base)->e_lfanew);
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)target_base;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)target_base + dos->e_lfanew);
     PVOID ep = (PVOID)((BYTE*)target_base + nt->OptionalHeader.AddressOfEntryPoint);
-    logf("[*] 目标已装载: base=%p ep=%p size=0x%lx\n", target_base, ep, nt->OptionalHeader.SizeOfImage);
+    logf("[*] 目标已映射: base=%p ep=%p size=0x%lx（入口点尚未运行）\n",
+         target_base, ep, nt->OptionalHeader.SizeOfImage);
+
+    // ---- 1c. 把目标的目录加进 DLL 搜索路径 ----
+    //
+    // 这一步是实测需要的，而且是这个工具跑真实游戏时**唯一**挡路的东西：
+    // Sky.exe 的导入表里有 steam_api64.dll、fmod.dll、fmodstudio.dll、vulkan-1.dll、igvk64.dll，
+    // 它们都在**游戏目录**里，而引擎进程叫 guadbg.exe、住在自己的工作区目录，
+    // 于是默认搜索路径找不到它们——实测 `LoadLibraryA("steam_api64.dll")` 返回 NULL，
+    // 引擎以"导入模块缺失"退出，在第 16 个描述符上。
+    //
+    // SetDllDirectoryW 把该目录插进搜索顺序（在系统目录之后、当前目录之前），
+    // 这正是系统加载器为一个住在该目录里的 exe 所做的事。用绝对路径取目录，
+    // 因为映像路径可能来自任意位置。
+    {
+        WCHAR dir[MAX_PATH];
+        wcsncpy_s(dir, g_target_path, _TRUNCATE);
+        PWSTR slash = wcsrchr(dir, L'\\');
+        if (slash) {
+            *slash = 0;
+            if (SetDllDirectoryW(dir)) {
+                logf("[*] DLL 搜索目录已设为: %ls\n", dir);
+            } else {
+                logf("[!] SetDllDirectoryW 失败 (%lu)，依赖 DLL 可能找不到\n", GetLastError());
+            }
+        }
+    }
 
     if (snap_imports(target_base) != 0) return 1;
-
+    // PLACEHOLDER_REMOVED
+    // ---- 1b. 补一个 Ldr 条目，并采用映像头里的路径 ----
+    //
+    // 以映像资源方式映射的模块不在加载器列表里，所以这里**自己补一条**，而不是去找一条。
+    // 补的理由不是好看：目标代码会调用 GetModuleHandle(NULL)、EnumProcessModules、
+    // 以及遍历 PEB->Ldr 的反调试检查，缺了条目它们看到的是一台没有主模块的进程。
+    //
+    // EntryPoint 填的是真正的入口点。这一点要紧：某些反篡改逻辑用
+    // `((PIMAGE_NT_HEADERS)base)->OptionalHeader.AddressOfEntryPoint` 交叉核对 Ldr 条目，
+    // 而系统装载的 EXE 那条记录里 EntryPoint 指向的是**运行时包装**（kernel32!BaseThreadInitThunk
+    // 附近），不是映像入口。填映像入口是与本引擎"寄生线程直接跳入口点"的执行模型一致的。
     {
         X_PEB_LDR_DATA* ldr = (X_PEB_LDR_DATA*)peb->Ldr;
         LIST_ENTRY* head = &ldr->InLoadOrderModuleList;
-        LIST_ENTRY* cur = head->Flink;
-        while (cur && cur != head) {
-            X_LDR_DATA_TABLE_ENTRY* e = (X_LDR_DATA_TABLE_ENTRY*)cur;
-            if (e->DllBase == target_base) {
-                e->EntryPoint = ep;
-                if (e->FullDllName.Buffer && e->FullDllName.Length) {
-                    SIZE_T chars = e->FullDllName.Length / sizeof(WCHAR);
-                    if (chars < MAX_PATH) {
-                        memcpy(g_target_path, e->FullDllName.Buffer, e->FullDllName.Length);
-                        g_target_path[chars] = 0;
-                    }
-                }
-                break;
-            }
-            cur = cur->Flink;
+        bool present = false;
+        for (LIST_ENTRY* cur = head->Flink; cur && cur != head; cur = cur->Flink) {
+            if (((X_LDR_DATA_TABLE_ENTRY*)cur)->DllBase == target_base) { present = true; break; }
         }
-        logf("[*] 采用 Ldr FullDllName: %ls\n", g_target_path);
+        if (present) {
+            logf("[*] Ldr 已含该模块（退化路径）\n");
+        } else {
+            // 复用映像头里的 FullDllName 需要一块自己的缓冲：Ldr 条目在模块生命周期内有效，
+            // 所以用进程堆分配并把映像路径写进去。
+            SIZE_T plen = (wcslen(g_target_path) + 1) * sizeof(WCHAR);
+            X_LDR_DATA_TABLE_ENTRY* e =
+                (X_LDR_DATA_TABLE_ENTRY*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*e));
+            PWSTR nbuf = (PWSTR)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, plen + 16);
+            if (e && nbuf) {
+                memcpy(nbuf, g_target_path, plen);
+                e->DllBase = target_base;
+                e->EntryPoint = ep;
+                e->SizeOfImage = nt->OptionalHeader.SizeOfImage;
+                e->FullDllName.Buffer = nbuf;
+                e->FullDllName.Length = (USHORT)(plen - 2);
+                e->FullDllName.MaximumLength = (USHORT)plen;
+                // BaseDllName 取路径最后一段
+                PWSTR leaf = nbuf;
+                for (PWSTR q = nbuf; *q; ++q) if (*q == L'\\' || *q == L'/') leaf = q + 1;
+                e->BaseDllName.Buffer = leaf;
+                e->BaseDllName.Length = (USHORT)(wcslen(leaf) * sizeof(WCHAR));
+                e->BaseDllName.MaximumLength = e->BaseDllName.Length + sizeof(WCHAR);
+                // 自指的空链表，而不是零。未使用的 LIST_ENTRY 在全零时会把 NULL 交给
+                // 任何顺着它走的遍历——而 ntdll 正是这样用 HashLinks 和 ForwarderLinks 的。
+                e->HashLinks.Flink = e->HashLinks.Blink = &e->HashLinks;
+                e->ForwarderLinks.Flink = e->ForwarderLinks.Blink = &e->ForwarderLinks;
+                e->ServiceTagLinks.Flink = e->ServiceTagLinks.Blink = &e->ServiceTagLinks;
+                e->StaticLinks.Flink = e->StaticLinks.Blink = &e->StaticLinks;
+                e->LoadCount = 0xFFFF;          // 加载器对"不可卸载"的模块用的哨兵值
+                e->TlsIndex = 0xFFFFFFFF;       // 无 TLS
+                e->Flags = 0;
+                e->OriginalBase = (ULONG_PTR)target_base;
+                e->EntryPointActivationContext = NULL;
+                // Insert all THREE lists. Windows walks InLoadOrder for module enumeration,
+                // InMemoryOrder for the GetModuleHandle family, and InInitializationOrder when it
+                // needs dependency order. An entry present in only one of them is a shape no real
+                // loader produces, and a check that compares the lists against each other would
+                // see it immediately.
+                //
+                // InsertHeadList is written out rather than called: it lives in ntdll and is not
+                // declared by the headers available here, and it is three pointer assignments.
+                auto insert_head = [](LIST_ENTRY* head, LIST_ENTRY* entry) {
+                    entry->Flink = head->Flink;
+                    entry->Blink = head;
+                    head->Flink->Blink = entry;
+                    head->Flink = entry;
+                };
+                insert_head(head, &e->InLoadOrderLinks);
+                insert_head(&ldr->InMemoryOrderModuleList, &e->InMemoryOrderLinks);
+                insert_head(&ldr->InInitializationOrderModuleList, &e->InInitializationOrderLinks);
+                logf("[*] 已补 Ldr 条目: base=%p ep=%p name=%ls\n",
+                     (void*)e->DllBase, (void*)e->EntryPoint, e->BaseDllName.Buffer);
+            } else {
+                logf("[-] Ldr 条目分配失败，继续（部分反调试查询会看到缺少主模块）\n");
+            }
+        }
     }
 
     // ---- 2. PEB 指向目标 ----
@@ -3807,13 +4219,30 @@ int main(int argc, char** argv) {
     }
 
     // ---- 3. 目标设备路径 ----
+    //
+    // 这里**不能**再用 NtQueryVirtualMemory(..., MemoryMappedFilenameInformation, ...)：
+    // 它要求那段内存是一次文件映射，而手动映射用的是 VirtualAlloc，没有文件名。
+    // 实测：在手动映射之后这一步返回 st=c0000141，引擎就此退出。
+    //
+    // 路径本来就已知，所以改成从 DOS 路径构造设备路径：取出盘符，用 QueryDosDeviceW
+    // 换成 \Device\HarddiskVolumeN。这正是内核对映像路径做的那件事，结果与
+    // NtQueryVirtualMemory 给出的一致。
     {
-        WCHAR namebuf[520]; SIZE_T rl = 0;
-        NTSTATUS st = g_ntqvm(GetCurrentProcess(), target_base, 2,
-            namebuf, sizeof(namebuf), &rl);
-        if (!NT_SUCCESS(st) || !rl) { logf("[-] 目标设备路径失败 st=%lx\n", st); return 1; }
-        X_UNICODE_STRING* us = (X_UNICODE_STRING*)namebuf;
-        wcsncpy_s(g_target_device, us->Buffer, _TRUNCATE);
+        g_target_device[0] = 0;
+        if (g_target_path[0] && g_target_path[1] == L':') {
+            WCHAR drive[3] = { g_target_path[0], L':', 0 };
+            WCHAR devName[512] = { 0 };
+            if (QueryDosDeviceW(drive, devName, 512)) {
+                _snwprintf_s(g_target_device, 520, _TRUNCATE, L"%ls%ls", devName,
+                             g_target_path + 2);
+            }
+        }
+        if (!g_target_device[0]) {
+            // 盘符查询失败（UNC 路径等）时退回原路径：伪装的目的地是"看起来像目标"，
+            // 而一条与 ImagePathName 一致的路径仍比空字符串好。
+            wcsncpy_s(g_target_device, g_target_path, _TRUNCATE);
+            logf("[!] QueryDosDevice 未给出设备路径，退回原路径\n");
+        }
         logf("[*] 目标设备路径: %ls\n", g_target_device);
     }
 

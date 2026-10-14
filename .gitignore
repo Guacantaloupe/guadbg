@@ -11,3 +11,23 @@ third_party/imgui/
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 调试探测的产物：每次探测都会重新产生，不是源码
+*.err
+/bp.txt
+/steam_bp.txt
+bp_out.txt
+/m.json
+/m3.json
+/m4.json
+mods.json
+mods_now.json
+mods2.json
+mods3.json
+stack.json
+stack_hits.json
+exp.json
+wins1.json
+wins2.json
+wins3.json
+wins4.json

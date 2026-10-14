@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """guadbg 端到端冒烟测试 v2 —— 经 test_client.exe（绕过 python 沙箱管道限制）"""
 import json
+import os
 import subprocess
 import time
 import sys
 
-ROOT = r"C:\Users\scree\kimi\tasks\2026-10-13\08-46-14-4e459719\guadbg"
-CLIENT = ROOT + r"\test_client.exe"
+# The author's script carries the path of the machine it was written on. Deriving it from this
+# file makes the test run wherever the repository is checked out, which is the difference between
+# a test someone else can run and one only its author can.
+ROOT = os.path.dirname(os.path.abspath(__file__))
+CLIENT = os.path.join(ROOT, "test_client.exe")
 
 fails = []
 
