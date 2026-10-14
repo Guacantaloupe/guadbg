@@ -909,15 +909,41 @@ static int mem_readable(ULONG_PTR addr, SIZE_T len) {
 }
 
 static SIZE_T mem_read_safe(ULONG_PTR addr, void* out, SIZE_T len) {
+    //
+    // 这里原来是**直接 memcpy**（第 919 行），而保护检查只做两个精确比较：
+    //     mbi.Protect == PAGE_NOACCESS || mbi.Protect == PAGE_GUARD
+    //
+    // 两个缺陷叠在一起就会**打死整个进程**：
+    //   ① `mbi.Protect` 可以是带修饰位的值（例如 PAGE_NOACCESS|PAGE_NOCACHE
+    //      是 0x40000001），精确比较匹配不上，于是"不可读"这一个判断漏过；
+    //   ② 一旦漏过就直接 memcpy，页不可读时是**致命异常**，而引擎的 VEH
+    //      不接管搜索路径，所以表现是 "engine closed pipe" ——
+    //      调用者只看到连接断开，看不到原因。
+    //
+    // 实测：在 Sky.exe（521 MB 工作集）上 search_str **每次**都打死引擎。
+    //
+    // 修法用系统自己的接口：`ReadProcessMemory` 在不可读时**返回 FALSE**，
+    // 而不是抛异常。它是同一个进程句柄，所以没有任何权限问题。
+    // 这样"读了但读不到"变成一个可以通过返回值处理的正常情况。
     SIZE_T done = 0;
+    HANDLE h = GetCurrentProcess();
     while (done < len) {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery((PVOID)(addr + done), &mbi, sizeof(mbi))) break;
-        if (mbi.State != MEM_COMMIT || mbi.Protect == PAGE_NOACCESS || mbi.Protect == PAGE_GUARD) break;
+        if (mbi.State != MEM_COMMIT) break;
+        // 用掩码判断，而不是精确相等 —— 修饰位（NOCACHE / WRITECOMBINE /
+        // GUARD 组合）不应让"不可读"这个结论失效。
+        DWORD prot = mbi.Protect & 0xFF;
+        if (prot == PAGE_NOACCESS || prot == PAGE_EXECUTE ||
+            (mbi.Protect & PAGE_GUARD)) break;
         SIZE_T chunk = (SIZE_T)mbi.BaseAddress + mbi.RegionSize - (addr + done);
         if (chunk > len - done) chunk = len - done;
-        memcpy((BYTE*)out + done, (PVOID)(addr + done), chunk);
-        done += chunk;
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(h, (PVOID)(addr + done), (BYTE*)out + done, chunk, &got))
+            break;                      // 读不到就停在这里，把已读到的量报回去
+        if (!got) break;
+        done += got;
+        if (got < chunk) break;
     }
     return done;
 }
@@ -3157,7 +3183,15 @@ static jval* cmd_dispatch(const char* cmd, jval* args, jval* result) {
         jv_put(result, "hits", hits);
     }
     else if (!strcmp(cmd, "search_str")) {
+        // 参数名原来只认 "s"，而 search_bytes 认 "pattern" —— 两个同类命令用不同的键，
+        // 而报错写的是内部变量名 "s 为空"，从调用侧看像"我明明给了串"。
+        // 后果不是难用，而是**危险的**：调用者会把它读成"内存里没有这个串"，
+        // 于是一个参数名不匹配变成了一条关于目标的否定结论。
+        // （本项目在 Sky.exe 上正是这样得到过一次"0 命中"。）
+        //
+        // 现在两个键都收：s 保持兼容，pattern 与 search_bytes 对齐。
         const char* s = jv_strval(args, "s", "");
+        if (!s || !*s) s = jv_strval(args, "pattern", "");
         int uni = jv_get(args, "unicode") ? (jv_get(args, "unicode")->boolean) : 0;
         unsigned long long start = jv_numval(args, "start", 0);
         unsigned long long end = jv_numval(args, "end", 0x00007FFF00000000ULL);
@@ -3167,29 +3201,64 @@ static jval* cmd_dispatch(const char* cmd, jval* args, jval* result) {
             for (const char* p = s; *p && pn < sizeof(pat) - 2; p++) { pat[pn++] = (BYTE)*p; pat[pn++] = 0; }
         }
         else { strncpy_s((char*)pat, sizeof(pat), s, _TRUNCATE); pn = strlen(s); }
-        if (!pn) { jv_put(result, "error", jv_str("s 为空")); return result; }
+        // 报错要说出**调用者该给什么**，而不是内部变量叫什么。
+        if (!pn) { jv_put(result, "error", jv_str("缺少参数：请给 \"s\"（或 \"pattern\"）")); return result; }
+        //
+        // 这一段原来每个区域 malloc 最多 64 MB，而且**不检查 malloc 的返回值**。
+        // 在空闲内存只有几百 MB 的机器上，第一次失败就写空指针 —— 实测表现为
+        // "engine closed pipe"：引擎整个崩掉，而调用者只看到连接断开。
+        //
+        // 更要紧的是**结果的可信度**：原来无论扫了多少内存，返回的都只是 hits。
+        // 于是"0 命中"无法区分下面两件事：
+        //     a) 目标内存里真的没有这个串
+        //     b) 一个区域都没扫成（分配失败、读失败、范围给错）
+        // 本项目已经因为这种不可审计的否定吃过亏（Sky.exe 上一次"0 命中"，
+        // 实际是参数名不匹配导致的错误返回）。所以现在把覆盖量一起报出来：
+        //     regions_scanned / regions_skipped / bytes_scanned / truncated
+        // 有了它们，"0 命中"才是一个可以判断的结论。
+        const SIZE_T WINDOW = 1u << 20;      // 1 MB：小到不会分配失败
         jval* hits = jv_new(4);
         ULONG_PTR a = (ULONG_PTR)start;
         MEMORY_BASIC_INFORMATION mbi;
+        unsigned long long nreg = 0, nskip = 0, nbytes = 0, ntrunc = 0;
         while (a < (ULONG_PTR)end) {
             if (!VirtualQuery((PVOID)a, &mbi, sizeof(mbi))) break;
+            ULONG_PTR rbase = (ULONG_PTR)mbi.BaseAddress;
+            SIZE_T rsize = mbi.RegionSize;
             if (mbi.State == MEM_COMMIT && mbi.Protect != PAGE_NOACCESS && mbi.Protect != PAGE_GUARD) {
-                SIZE_T rlen = mbi.RegionSize > 64 * 1024 * 1024 ? 64 * 1024 * 1024 : mbi.RegionSize;
-                BYTE* buf = (BYTE*)malloc(rlen + 1);
-                SIZE_T got = mem_read_safe((ULONG_PTR)mbi.BaseAddress, buf, rlen);
-                for (SIZE_T i = 0; i + pn <= got; i++) {
-                    if (memcmp(buf + i, pat, pn) == 0) {
-                        jv_add(hits, jv_num((double)((ULONG_PTR)mbi.BaseAddress + i)));
-                        if (hits->n >= 512) break;
+                BYTE* buf = (BYTE*)malloc(WINDOW + 1);
+                if (!buf) { nskip++; }
+                else {
+                    nreg++;
+                    SIZE_T done = 0;
+                    while (done < rsize && hits->n < 512) {
+                        SIZE_T want = rsize - done;
+                        if (want > WINDOW) { want = WINDOW; ntrunc++; }
+                        SIZE_T got = mem_read_safe(rbase + done, buf, want);
+                        if (got) {
+                            nbytes += got;
+                            for (SIZE_T i = 0; i + pn <= got; i++) {
+                                if (memcmp(buf + i, pat, pn) == 0) {
+                                    jv_add(hits, jv_num((double)(rbase + done + i)));
+                                    if (hits->n >= 512) break;
+                                }
+                            }
+                        }
+                        else { nskip++; }
+                        done += want;
                     }
+                    free(buf);
                 }
-                free(buf);
-                if (hits->n >= 512) break;
             }
-            if (!mbi.RegionSize) break;
-            a = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+            if (hits->n >= 512) break;
+            if (!rsize) break;
+            a = rbase + rsize;
         }
         jv_put(result, "hits", hits);
+        jv_put(result, "regions_scanned", jv_num((double)nreg));
+        jv_put(result, "regions_skipped", jv_num((double)nskip));
+        jv_put(result, "bytes_scanned", jv_num((double)nbytes));
+        jv_put(result, "windows_scanned", jv_num((double)ntrunc));
     }
 
     else if (!strcmp(cmd, "mem_map")) {
