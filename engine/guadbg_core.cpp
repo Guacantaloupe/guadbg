@@ -3732,7 +3732,14 @@ static jval* cmd_dispatch(const char* cmd, jval* args, jval* result) {
         const char* hex = jv_strval(args, "hex", "");
         BYTE buf[16];
         size_t n = hex2bin(hex, buf, sizeof(buf));
-        if (!u || !n) { jv_put(result, "error", jv_str("参数无效")); return result; }
+        // 报错要说清**缺哪个键**。
+        // 原来只说 "参数无效"，而调用者从外部看到的只有这一句——
+        // 于是"键名不对"和"地址为 0"和"十六进制串不合法"三种情况无法区分。
+        // 本项目已经因为这一类吃过四次（search_str 的 s/pattern、list_bps 的
+        // breakpoints/bps、read_mem 的 len/size、以及这里的 hex/bytes）。
+        // 生成 docs/COMMAND_SCHEMA.md 是第一步，把错误消息说清楚是第二步。
+        if (!u) { jv_put(result, "error", jv_str("缺少或无效参数：addr（补丁地址，非 0）")); return result; }
+        if (!n) { jv_put(result, "error", jv_str("缺少或无效参数：hex（十六进制字节串，如 \"31 C0 C3\"）")); return result; }
         int id = 0;
         for (int i = 0; i < MAX_PATCH; i++) {
             if (!g_patches[i].used) {
