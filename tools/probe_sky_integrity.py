@@ -239,6 +239,28 @@ def main():
                     result["sky_guard"] = "%#x" % gaddr
                 else:
                     problems.append("--guard-sky 的 set_mem_bp 失败: %s" % r.get("error"))
+            # 可选：把**整段**若干页全部挂上保护页。
+            #
+            # 为什么要整段：第 127 轮量到 .sky[0] 里有 871 个连续段被改写
+            # （偏移 0x2f3b..0xbf08、步距 8），而第 137 轮只挂了第 0 页
+            # —— 那一页里一个都没覆盖到。要解释这 871 个字段，就必须把
+            # 它们所在的那十页都放进记录里。
+            if "--guard-range" in sys.argv:
+                i = sys.argv.index("--guard-range")
+                rbase = int(sys.argv[i + 1], 0)
+                rsize = int(sys.argv[i + 2], 0)
+                okn = 0
+                for off in range(0, rsize, 0x1000):
+                    r = call("set_mem_bp", {"addr": rbase + off, "size": 0x1000}).get("result", {})
+                    if r.get("error") is None and r.get("id") is not None:
+                        okn += 1
+                    else:
+                        problems.append("--guard-range 第 %#x 页失败: %s"
+                                        % (off, r.get("error")))
+                print("  **故意触发（保护页 ×%d 页）**：%#x..%#x"
+                      % (okn, rbase, rbase + rsize))
+                result["sky_guard_range"] = {"base": "%#x" % rbase,
+                                             "size": rsize, "pages": okn}
             call("resume")
             t0 = time.time()
             last_note = 0.0
@@ -247,9 +269,25 @@ def main():
                 s = call("get_state").get("result", {})
                 st = s.get("state")
                 if st is None:
-                    print("    %5.0f 秒: **引擎已不应答（管道断了）** —— 进程消失"
+                    # **必须分清两件事**：引擎进程死了，还是它活着但管道不再应答。
+                    # 只报一句"引擎已不应答"会把这两件事混成一个 —— 而它们的下一步完全不同。
+                    # 判据：eng.poll()（None=子进程仍在跑）+ 再等一会儿重试一次 get_state。
+                    print("    %5.0f 秒: **管道断了**（get_state 无应答）—— 正在分辨两种可能"
                           % (time.time() - t0))
-                    result["watch_end"] = "pipe-closed"
+                    time.sleep(5)
+                    retry = call("get_state").get("result", {})
+                    alive = eng.poll()
+                    if alive is None:
+                        print("      · 重试 get_state：%s" % ("仍然无应答" if not retry
+                                                              else "又应答了（瞬时）"))
+                        print("      · eng.poll() = None ⇒ **引擎进程仍然活着**")
+                        print("        ⇒ 所以是'引擎活着但不再应答'，不是'进程消失'。")
+                        result["watch_end"] = "alive-but-mute"
+                        result["watch_retry_answered"] = bool(retry)
+                    else:
+                        print("      · eng.poll() = %r ⇒ **引擎进程已退出**" % alive)
+                        result["watch_end"] = "process-exited"
+                        result["engine_exit_code"] = alive
                     break
                 if st == "paused":
                     rip = s.get("rip", 0)
