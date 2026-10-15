@@ -358,6 +358,13 @@ def main():
             if spec.startswith("--"):
                 continue
             mod, _sep, nm = spec.partition("!")
+            if not _sep:
+                # **必须吵**：第 161 轮我把裸地址传给了 --hw-one，它去"查模块 0x141d7ab48 的导出"，
+                # 结果什么都没挂上，而报错行又被我自己的输出过滤器吃掉了 —— 白跑一次。
+                print("    **--hw-one 需要『模块!函数』格式，收到的是 %r；"
+                      "裸地址请用 --hw-exec-addr**" % spec)
+                problems.append("--hw-one 格式错: %r" % spec)
+                continue
             if not mods:
                 mods = call("list_modules").get("result", {}).get("modules", []) or []
             ex = call("exports", {"module": mod}).get("result", {})
@@ -398,6 +405,28 @@ def main():
             if r.get("id") is not None:
                 bpname[a] = "rw@%#x" % a
                 bpid[a] = r.get("id")
+
+        # --hw-exec-addr <addr>（可重复）：在**裸地址**上挂硬件执行断点。
+        # 有了它才能问"这段代码到底有没有被执行"（例如 CRT 启动 0x141d7ab48）——
+        # 这类地址不属于任何可解析的"模块!函数"，所以 --hw-one 用不了。
+        for i, a0 in enumerate(sys.argv):
+            if a0 != "--hw-exec-addr" or i + 1 >= len(sys.argv):
+                continue
+            spec = sys.argv[i + 1]
+            if spec.startswith("--"):
+                continue
+            a = int(spec, 0)
+            if not mods:
+                mods = call("list_modules").get("result", {}).get("modules", []) or []
+            r = call("set_hw_bp", {"addr": a, "size": 1, "mode": "execute"}).get("result", {})
+            print("    硬件执行断点（裸地址）@ %#x -> %s"
+                  % (a, "id=%s" % r.get("id") if r.get("id") is not None
+                     else "**失败: %s**" % r.get("error")))
+            if r.get("id") is not None:
+                bpname[a] = "exec@%#x" % a
+                bpid[a] = r.get("id")
+            else:
+                problems.append("set_hw_bp(裸地址) 失败 @ %#x: %s" % (a, r.get("error")))
 
         # --manual-pause：**对照实验** —— 不用任何断点，只像陷阱那样把目标停一小会儿。
         #
