@@ -2668,6 +2668,26 @@ static void trace_record(CONTEXT* c) {
 }
 
 // ---- VEH ----
+
+// 栈上取一段 qword 落进日志。**单独一个函数**，理由有两条：
+//   1) __try 不能出现在"需要对象展开"的函数里（MSVC C2712），而 VEH 那个大函数里有
+//      带析构的局部量，所以把 __try 挪到这里；
+//   2) 栈已经溢出时，读 [rsp+..] 可能再次违例，必须有 __except 兜住，
+//      否则引擎会在处理异常的路上再抛一次异常。
+static void dump_stack_window(unsigned long long rsp, int n) {
+    __try {
+        const unsigned long long* sp = (const unsigned long long*)rsp;
+        for (int i = 0; i < n; i++) {
+            if ((i % 4) == 0) logf("[!]   [rsp+%03x]", i * 8);
+            logf(" %016llx", sp[i]);
+            if ((i % 4) == 3) logf("\n");
+        }
+        if (n % 4) logf("\n");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        logf("\n[!]   读栈时又违例 —— 现场只记到那一个 qword 为止\n");
+    }
+}
+
 static LONG NTAPI gua_veh(PEXCEPTION_POINTERS ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     DWORD tid = GetCurrentThreadId();
@@ -2896,10 +2916,53 @@ static LONG NTAPI gua_veh(PEXCEPTION_POINTERS ep) {
     }
     case 0xE06D7363:   // C++ 异常：不拦截
         return EXCEPTION_CONTINUE_SEARCH;
+    case EXCEPTION_STACK_OVERFLOW: {
+        // 栈溢出**不能**走下面那条"暂停然后放行"的路。理由不是推理，是实测：
+        // 放行之后 OS 因无人处理而终止进程 —— 而引擎与被调试者**在同一个进程里**
+        // （寄生架构的固有代价），于是引擎跟着一起死。第 131 轮观测到的结局正是
+        // "探针那一头只拿到 engine closed pipe"，之后再也问不出任何东西。
+        //
+        // 所以这里先把**现场**落进日志（探针会把引擎 stdout 收进 probe_*_engine.log），
+        // 这样即使进程随后仍然死掉，至少留下一份可读的记录。本轮只求这一件事。
+        //
+        // 另注：第 131 轮那次 info2 = 0xde4ac03000 落在**堆区**而不是线程栈，
+        // 与前面观测到的栈枢轴（xchg [rsp],r9 / pop rsp）一致。那条线索记在文档里，
+        // 这里不据它下任何结论。
+        logf("[!] ==== 栈溢出 现场 ====\n");
+        logf("[!] code=%08X addr=%llx 是否保护页=%llu 触到的地址=%llx\n",
+             code,
+             (unsigned long long)ep->ExceptionRecord->ExceptionAddress,
+             (unsigned long long)ep->ExceptionRecord->ExceptionInformation[0],
+             (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
+        logf("[!] rip=%016llx rsp=%016llx rbp=%016llx\n",
+             (unsigned long long)c->Rip, (unsigned long long)c->Rsp,
+             (unsigned long long)c->Rbp);
+        logf("[!] rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n",
+             (unsigned long long)c->Rax, (unsigned long long)c->Rbx,
+             (unsigned long long)c->Rcx, (unsigned long long)c->Rdx);
+        logf("[!] rsi=%016llx rdi=%016llx r8 =%016llx r9 =%016llx\n",
+             (unsigned long long)c->Rsi, (unsigned long long)c->Rdi,
+             (unsigned long long)c->R8, (unsigned long long)c->R9);
+        logf("[!] r10=%016llx r11=%016llx r12=%016llx r13=%016llx\n",
+             (unsigned long long)c->R10, (unsigned long long)c->R11,
+             (unsigned long long)c->R12, (unsigned long long)c->R13);
+        logf("[!] r14=%016llx r15=%016llx\n",
+             (unsigned long long)c->R14, (unsigned long long)c->R15);
+        logf("[!] 栈窗口 32 个 qword：\n");
+        dump_stack_window((unsigned long long)c->Rsp, 32);
+        logf("[!] ==== 现场结束 ====\n");
+        // 仍然让探针看到这次命中（与规格里的"首过暂停"一致），然后放行。
+        {
+            char sreason[192];
+            sprintf_s(sreason, "栈溢出 @ 0x%llx",
+                      (unsigned long long)ep->ExceptionRecord->ExceptionAddress);
+            pause_here(ep, tid, sreason);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     case EXCEPTION_ACCESS_VIOLATION:
     case EXCEPTION_ILLEGAL_INSTRUCTION:
     case EXCEPTION_INT_DIVIDE_BY_ZERO:
-    case EXCEPTION_STACK_OVERFLOW:
     case EXCEPTION_PRIV_INSTRUCTION:
     default: {
         if (code == DBG_PRINTEXCEPTION_C || code == DBG_PRINTEXCEPTION_WIDE_C)
@@ -4462,8 +4525,18 @@ int main(int argc, char** argv) {
     }
 
     // ---- 6. 寄生线程：创建时起点即目标 EP，主线程随后退出 ----
-    logf("[*] 创建寄生线程 @ %p\n", ep);
-    g_par_thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)ep, NULL, 0, &g_par_tid);
+    //
+    // dwStackSize 必须是**目标自己声明的** SizeOfStackReserve，**不能传 0**。
+    // 传 0 的语义是"用宿主映像的默认值"，而宿主是 guadbg.exe。
+    // 第 132 轮实测的两个数：
+    //     Sky.exe     SizeOfStackReserve = 0x200000（2 MB）
+    //     guadbg.exe  SizeOfStackReserve = 0x100000（1 MB）
+    // ⇒ 传 0 等于让游戏在**只有它要的一半**的栈上跑，深度稍大就
+    //   STATUS_STACK_OVERFLOW（0xC00000FD，保护页命中，实测 rsp=…51f8 而触到 …3000）。
+    const SIZE_T want_stack = (SIZE_T)nt->OptionalHeader.SizeOfStackReserve;
+    logf("[*] 创建寄生线程 @ %p（栈 %llu MB，取自目标声明的 SizeOfStackReserve）\n",
+         ep, (unsigned long long)(want_stack / (1024 * 1024)));
+    g_par_thread = CreateThread(NULL, want_stack, (LPTHREAD_START_ROUTINE)ep, NULL, 0, &g_par_tid);
     if (!g_par_thread) { logf("[-] CreateThread 失败 %lu\n", GetLastError()); return 1; }
 
     logf("[*] 宿主主线程退出\n");
