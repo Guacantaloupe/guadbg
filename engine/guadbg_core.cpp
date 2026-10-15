@@ -37,6 +37,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <intrin.h>   // _ReturnAddress()：钩子里要记"是谁调的我"
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "psapi.lib")
@@ -4336,12 +4337,28 @@ static PFN_GetModuleFileNameW g_orig_gmfnw = NULL;
 static PFN_GetModuleFileNameA g_orig_gmfna = NULL;
 static int g_gmfn_logged = 0;
 
+// 目标映像里**可执行的段**（本目标就是两个 .sky）。用来判断"这次调用是谁发的"。
+// 第 149 轮量到：GetModuleFileNameW 的调用者里，两个来自保护层（.sky），
+// 第三个来自 **.text 里的游戏真代码** —— 而当时钩子对**所有**调用者都答目标路径，
+// 于是把 .text 那份代码也改坏了（随后崩在 RtlEnterCriticalSection(NULL)）。
+// 所以正确做法是**按调用者过滤**：只对保护层改答案。
+static ULONG_PTR g_tgt_xr[16][2];
+static int g_tgt_xr_n = 0;
+
+static int caller_is_target_code(PVOID ra) {
+    ULONG_PTR a = (ULONG_PTR)ra;
+    for (int i = 0; i < g_tgt_xr_n; i++)
+        if (a >= g_tgt_xr[i][0] && a < g_tgt_xr[i][1]) return 1;
+    return 0;
+}
+
 static DWORD WINAPI hk_getmodulefilenamew(HMODULE hModule, LPWSTR lpFilename, DWORD nSize) {
-    if (lpFilename && nSize && hModule == NULL) {
+    if (lpFilename && nSize && hModule == NULL && caller_is_target_code(_ReturnAddress())) {
         SIZE_T n = wcslen(g_target_path);
         if (g_gmfn_logged < 20) {
             g_gmfn_logged++;
-            logf("[i] GetModuleFileNameW(NULL) -> 目标路径（第 %d 次）\n", g_gmfn_logged);
+            logf("[i] GetModuleFileNameW(NULL) -> 目标路径（第 %d 次）caller=%p\n",
+                 g_gmfn_logged, _ReturnAddress());
         }
         if (n + 1 > nSize) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return nSize; }
         memcpy(lpFilename, g_target_path, (n + 1) * sizeof(WCHAR));
@@ -4353,7 +4370,7 @@ static DWORD WINAPI hk_getmodulefilenamew(HMODULE hModule, LPWSTR lpFilename, DW
 }
 
 static DWORD WINAPI hk_getmodulefilenamea(HMODULE hModule, LPSTR lpFilename, DWORD nSize) {
-    if (lpFilename && nSize && hModule == NULL) {
+    if (lpFilename && nSize && hModule == NULL && caller_is_target_code(_ReturnAddress())) {
         char narrow[MAX_PATH * 2];
         int n = WideCharToMultiByte(CP_ACP, 0, g_target_path, -1, narrow,
                                     (int)sizeof(narrow), NULL, NULL);
@@ -4620,6 +4637,26 @@ int main(int argc, char** argv) {
     if (env_on("GUADBG_SKIP_HOOK")) {
         logf("[!] GUADBG_SKIP_HOOK：跳过 kernel32 钩子（诊断用）\n");
     } else {
+    // 记下**保护层**的段区间（名字以 .sky 开头）—— 供 GetModuleFileName* 钩子按调用者过滤用。
+    //
+    // 第 149 轮第一次过滤写错了：我按"可执行段"过滤，而 .text 也是目标的**可执行段**，
+    // 于是来自 .text 的那次调用照样被改了答案（日志里第 3 次 caller=0x141DB7665 仍在）。
+    // 正确的判据是**只有保护层**（.sky 段）该被改答案：游戏真代码拿到的是它本来的宿主路径。
+    g_tgt_xr_n = 0;
+    {
+        PIMAGE_SECTION_HEADER s2 = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections && g_tgt_xr_n < 16; ++i, ++s2) {
+            if (strncmp((const char*)s2->Name, ".sky", 4) != 0) continue;
+            ULONG_PTR lo = (ULONG_PTR)target_base + s2->VirtualAddress;
+            ULONG_PTR hi = lo + (s2->Misc.VirtualSize ? s2->Misc.VirtualSize : s2->SizeOfRawData);
+            g_tgt_xr[g_tgt_xr_n][0] = lo;
+            g_tgt_xr[g_tgt_xr_n][1] = hi;
+            g_tgt_xr_n++;
+            logf("[*] 保护层段（调用者过滤用）: %#llx..%#llx\n",
+                 (unsigned long long)lo, (unsigned long long)hi);
+        }
+    }
+
     hook_pair_k32(hKernel32, "QueryFullProcessImageNameW",
         hk_queryfullprocessimagenamew, (PVOID*)&g_orig_qfpinw);
     hook_pair_k32(hKernel32, "K32GetProcessImageFileNameW",

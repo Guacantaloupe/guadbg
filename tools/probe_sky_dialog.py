@@ -271,7 +271,9 @@ def main():
         # 这是第 144 轮的正路：不再猜"关掉哪一步能躲过检查"，而是**直接抓做决定的那段代码** ——
         # 它要弹框就必然经过 MessageBoxW / MessageBoxA / MessageBoxIndirectW 之一，
         # 命中时的返回地址就是"判定游戏文件已损坏"的调用点（第 139 轮修好 Dr 之后才可行）。
-        mods = []
+        # 模块表**总是**取：这样连"异常暂停"的 rip 也能被解析成 模块+偏移。
+        # （第 149 轮那次崩溃只报了一个裸地址 0x7ff79a5fc040，看不出属于谁。）
+        mods = call("list_modules").get("result", {}).get("modules", []) or []
         if "--hw-msgbox" in sys.argv or "--hw-candidates" in sys.argv:
             # --hw-candidates：三个 MessageBox 出口**没有命中**（第 144 轮实测），说明这个对话框
             # 不是由它们创建的。所以改堵"任何窗口都得经过"的那几个咽喉：
@@ -439,8 +441,8 @@ def main():
                     call("resume")
                     continue
                 ins = call("disasm", {"addr": rip, "count": 3}).get("result", {}).get("lines", [])
-                print("    %5.1f 秒: **命中断点** rip=%#x reason=%s"
-                      % (time.time() - t0, rip, reason))
+                print("    %5.1f 秒: **命中断点** rip=%#x (%s) reason=%s"
+                      % (time.time() - t0, rip, where(rip, mods) or "不在已知模块里", reason))
                 for i in ins:
                     print("          %s" % i.get("text", i))
 
