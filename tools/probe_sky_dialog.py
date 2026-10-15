@@ -690,6 +690,28 @@ def main():
                     print("        tid=%-8s rip=%#-14x %s   susp=%s"
                           % (tid, rip, w or "（不在已知模块里）",
                              (t.get("suspended") if isinstance(t, dict) else "?")))
+                    # 寄存器：syscall 返回点上 rcx/r10 仍持有第一个参数（句柄），
+                    # 而 x64 系统调用的第 5 个及以后的参数在**栈**上（[rsp+0x28] 起）
+                    print("            rcx=%s rdx=%s r8=%s r9=%s rsp=%s"
+                          % (r.get("rcx"), r.get("rdx"), r.get("r8"), r.get("r9"), r.get("rsp")))
+                    rsp = as_int(r.get("rsp", 0)) if r.get("rsp") is not None else 0
+                    if rsp:
+                        mm = call("read_mem", {"addr": rsp, "len": 0x40}).get("result", {})
+                        hx = str(mm.get("hex", "")).replace(" ", "")
+                        if len(hx) >= 0x20:
+                            raw = bytes.fromhex(hx)
+                            qs = [int.from_bytes(raw[i:i + 8].ljust(8, b"\0"), "little")
+                                  for i in range(0, len(raw), 8)]
+                            print("            栈上 8 个 qword（syscall 的栈参数从这里看）: %s"
+                                  % " ".join("%#x" % x for x in qs))
+                    # **哪儿的代码在跑**：直接走这条线程的栈，只列验证过的返回地址并归属模块
+                    if r:
+                        ch = print_stack_chain(r, mods, 0x200)
+                        for slot, q, wq in ch:
+                            txt = wq
+                            if wq and wq.lower().startswith("sky.exe"):
+                                txt += "   ← **游戏模块**"
+                            print("              · %s" % txt)
                     result.setdefault("threads", []).append(
                         {"tid": str(tid), "rip": "%#x" % rip, "where": w})
             # 日志型断点：不停下，条目落在引擎的日志里 —— 每轮把新增的取出来打掉
