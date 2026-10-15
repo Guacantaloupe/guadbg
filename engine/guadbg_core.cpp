@@ -4523,20 +4523,21 @@ int main(int argc, char** argv) {
     logf("[*] 目标已映射: base=%p ep=%p size=0x%lx（入口点尚未运行）\n",
          target_base, ep, nt->OptionalHeader.SizeOfImage);
 
-    // ---- 1b2. GUADBG_SKY_INIT：把"已知必须补齐的那一簇初值"写进去（**默认关**） ----
+    // ---- 1b2. GUADBG_SKY_INIT：诊断开关（**默认关**）——注意：这里的写入**已知会被清掉** ----
     //
-    // 为什么需要（第 169~177 轮的结论）：
-    //   正常加载里 Sky.exe 的 .data+0x3bd7b0 = 1、+0x3bd780 = 0/0xffffffffffffffff、
-    //   +0x3bd7d0 = 0x80000001；而在我们的寄生宿主里这三处**从来没被写过**
-    //   （硬件写断点零命中），于是 CRT 分配包装走 `mov edi, 8` 那一支 ⇒
-    //   EnterCriticalSection((CS*)8) ⇒ `lock btr [rdi+8]` 访问 0x10 ⇒ 崩。
-    //   文件里也没有任何代码写这一簇（第 158 轮 --wrefs 给 0 处写；第 177 轮把窗口 0x1424e9700..0x1424e9900
-    //   的 105 处引用全看了一遍，都是读形状）。写者只能在 .sky（静态扫描在那里不可信）里 ⇒
-    //   与其继续找它，不如**把状态做对**：把这三处初值固化成一个开关，
-    //   让后续实验都从"已经跨过这道缺口"的状态开始，而不是每回手敲三遍 --write-at。
+    // **第 178 轮实测的结论（重要，别再把这里当成"有效修复"）**：
+    //   在**映射时**写这三处，随后会被清掉 —— 日志显示"三处全部写好"，但目标仍然以
+    //   同一个 AV 崩掉（info1=1 info2=0x10，即 `[8+8]`）。
+    //   真正生效的补写在**入口暂停之后、放行之前**（探针里的 GUADBG_SKY_INIT 就是这么做的，
+    //   第 178 轮验证与手工补逐帧一致）。
     //
-    // **默认关**：未验证的改动绝不进默认路径（本项目一直守的规矩）。
-    // **写失败必须大声报错**：绝不能让实验在"以为补了"的状态下继续。
+    // 那这里为什么还留着？—— 因为它能回答一个别处回答不了的问题：
+    //   "映射 → 入口断点"之间**只有引擎自己在跑**，所以这一簇若在这段里变成 0，
+    //   就说明**是我们自己清掉的**。于是本块被改成**诊断**：写完打一次读回值，
+    //   在设置入口断点之前再打一次（见下方"[d] ... 诊断 @ 入口断点前"）。
+    //
+    // 三处初值（正常加载里读到的）：
+    //   .data+0x3bd7b0 = 01、+0x3bd780 = 0/0xffffffffffffffff、+0x3bd7d0 = 0x80000001
     {
         char* env_sky_init = nullptr;
         size_t env_len = 0;
@@ -4548,7 +4549,8 @@ int main(int argc, char** argv) {
                 { 0x03bd780u, "0000000000000000ffffffffffffffff", 16, "锁/统计对象" },
                 { 0x03bd7d0u, "0100008000000000", 8, "计数器" },
             };
-            logf("[*] GUADBG_SKY_INIT=%s：写入已知必须补齐的初值\n", env_sky_init);
+            logf("[*] GUADBG_SKY_INIT=%s：（诊断）写入三处初值 —— 注意此处写入已知会被清掉\n",
+                 env_sky_init);
             int bad = 0;
             for (size_t k = 0; k < sizeof(kSkyInit) / sizeof(kSkyInit[0]); k++) {
                 const SkyInit& e = kSkyInit[k];
@@ -4580,8 +4582,10 @@ int main(int argc, char** argv) {
             }
             if (bad)
                 logf("[!] GUADBG_SKY_INIT：有 %d 处没写成 —— **本次运行的结论不可用**\n", bad);
-            else
-                logf("[*] GUADBG_SKY_INIT：三处全部写好\n");
+            else {
+                BYTE* chk = (BYTE*)target_base + 0x03bd7b0u;
+                logf("[*] GUADBG_SKY_INIT：三处写好；**写后立刻读回** 0x3bd7b0 = %02X\n", *chk);
+            }
             free(env_sky_init);
         }
     }
@@ -4797,6 +4801,14 @@ int main(int argc, char** argv) {
     }
 
     // ---- 5. 系统断点（入口点断点）：默认在入口下一次性断点，便于附加即停 ----
+    // 诊断（第 179 轮）：到这一步时那三处初值还在不在？
+    //   "映射 → 入口断点"之间**只有引擎自己跑**，所以这里若已是 0，就说明是**我们自己清掉的**。
+    if (getenv("GUADBG_SKY_INIT")) {
+        BYTE* chk0 = (BYTE*)target_base + 0x03bd7b0u;
+        BYTE* chk1 = (BYTE*)target_base + 0x03bd780u;
+        logf("[d] 诊断 @ 入口断点前: 0x3bd7b0 = %02X（写后应为 01）· 0x3bd780 = %016llX\n",
+             *chk0, (unsigned long long)*(ULONGLONG*)chk1);
+    }
     {
         EnterCriticalSection(&g_bp_lock);
         bp_t* bp = bp_alloc();
