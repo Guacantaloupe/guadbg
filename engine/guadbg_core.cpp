@@ -2799,6 +2799,9 @@ static LONG NTAPI gua_veh(PEXCEPTION_POINTERS ep) {
             BYTE cc = 0xCC;
             mem_write_safe(g_rearm_addr, &cc, 1);
         }
+        // 这一条单步是不是**我们自己**为了重装 PAGE_GUARD 而设的 TF 产生的？
+        // 见下面的 guard page 分支：那里设了 `c->EFlags |= 0x100`，内核随后会送来一次单步。
+        int self_step = 0;
         if (g_reguard_n) {
             EnterCriticalSection(&g_bp_lock);
             for (int i = 0; i < MAX_BP && g_reguard_n; i++) {
@@ -2813,6 +2816,7 @@ static LONG NTAPI gua_veh(PEXCEPTION_POINTERS ep) {
                 }
             }
             g_reguard_n = 0;
+            self_step = 1;   // 队列非空 ⇒ 这一次单步是我们自己排的
             LeaveCriticalSection(&g_bp_lock);
         }
         // 跟踪（仅寄生线程）
@@ -2879,7 +2883,15 @@ static LONG NTAPI gua_veh(PEXCEPTION_POINTERS ep) {
             }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        // 单步同时满足 trace over 临时断点（silent 已处理），非我方则透传
+        // 单步同时满足 trace over 临时断点（silent 已处理）。
+        //
+        // 而**我们自己排的那一次单步必须被消费掉**（CONTINUE_EXECUTION）：它是 guard page
+        // 分支设 TF 产生的，唯一用途是让内核把控制权交回来以便重装保护页。若在这里透传，
+        // 它就成了"无人处理的单步"，内核直接终止进程 —— 退出码正是 0x80000004
+        // （STATUS_SINGLE_STEP）。第 137 轮实测：保护页 + 硬件断点跑到 16 秒时进程消失，
+        // eng.poll() = 2147483652 = 0x80000004，而引擎日志在死前完全静默（logf 每行都
+        // fflush，所以那不是缓冲丢失，是真的什么都没做就成了这样）。
+        if (self_step) return EXCEPTION_CONTINUE_EXECUTION;
         return EXCEPTION_CONTINUE_SEARCH;
     }
     case EXCEPTION_GUARD_PAGE: {
