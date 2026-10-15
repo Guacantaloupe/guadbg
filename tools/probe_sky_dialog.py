@@ -328,6 +328,10 @@ def main():
     stack_chain = 0
     log_bps = set()
     log_since = 0
+    threads_at = 0.0
+    if "--threads-at" in sys.argv:
+        i = sys.argv.index("--threads-at")
+        threads_at = float(sys.argv[i + 1]) if i + 1 < len(sys.argv) else 10.0
     if "--stack-chain" in sys.argv:
         i = sys.argv.index("--stack-chain")
         stack_chain = int(sys.argv[i + 1], 0) if (i + 1 < len(sys.argv)
@@ -668,6 +672,26 @@ def main():
         seen = None
         while time.time() - t0 < secs:
             time.sleep(poll)
+            # --threads-at <秒>：到了那个时刻，把**每条线程**的 Rip 打出来并归属到模块+偏移。
+            #
+            # 用途（第 172 轮）：第 171 轮测出"目标跑约 2.5 秒 CPU 之后转入空闲"。
+            # 空闲时它到底停在哪？——直接看各线程 Rip 落在哪个模块/函数，比猜可靠。
+            if threads_at and not result.get("threads_done") and time.time() - t0 >= threads_at:
+                result["threads_done"] = True
+                print("    —— %.1f 秒时的线程状态 ——" % (time.time() - t0))
+                tl = call("list_threads").get("result", {}).get("threads") or []
+                print("      线程数 %d" % len(tl))
+                for t in tl[:12]:
+                    tid = t.get("tid") if isinstance(t, dict) else t
+                    g = call("get_ctx", {"tid": as_int(tid)}).get("result", {})
+                    r = g.get("regs") or {}
+                    rip = as_int(r.get("rip", 0)) if r.get("rip") is not None else 0
+                    w = where(rip, mods) if (rip and mods) else None
+                    print("        tid=%-8s rip=%#-14x %s   susp=%s"
+                          % (tid, rip, w or "（不在已知模块里）",
+                             (t.get("suspended") if isinstance(t, dict) else "?")))
+                    result.setdefault("threads", []).append(
+                        {"tid": str(tid), "rip": "%#x" % rip, "where": w})
             # 日志型断点：不停下，条目落在引擎的日志里 —— 每轮把新增的取出来打掉
             if log_bps:
                 lg = call("get_log", {"since": log_since}).get("result", {}) or {}
