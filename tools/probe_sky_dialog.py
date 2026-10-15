@@ -856,10 +856,14 @@ def main():
                     call("resume")
                     continue
                 ins = call("disasm", {"addr": rip, "count": 3}).get("result", {}).get("lines", [])
-                # --read-at：暂停时把这几个地址读出来（同一处只打一次，避免刷屏）
-                if read_at and not result.get("read_at_done"):
-                    result["read_at_done"] = True
-                    print("          —— 顺带读几个全局 ——")
+                # --read-at：暂停时把这几个地址读出来。
+                # 默认**只读第一次**（避免刷屏）；加 `--read-at-each` 则**每次暂停都读** ——
+                # 第 187 轮要用它：崩溃那一次暂停时的值，才是我们想知道的"当时值"
+                # （第一次暂停读到的可能只是我们刚写进去的值）。
+                if read_at and ("--read-at-each" in sys.argv or not result.get("read_at_done")):
+                    if "--read-at-each" not in sys.argv:
+                        result["read_at_done"] = True
+                    print("          —— 顺带读几个全局（暂停原因: %s）——" % reason[:40])
                     for a_r, l_r in read_at:
                         m = call("read_mem", {"addr": a_r, "len": l_r}).get("result", {})
                         hx = str(m.get("hex", "")).replace(" ", "")
