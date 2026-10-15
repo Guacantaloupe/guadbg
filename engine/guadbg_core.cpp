@@ -4315,6 +4315,22 @@ static void hook_pair_k32(HMODULE k32, const char* name, PVOID handler, PVOID* t
     logf("[*] 已钩 kernel32!%s @ %p\n", name, p);
 }
 
+// ---- 诊断开关：逐项关掉"引擎的加载与正常加载不同"的地方 ----
+//
+// 为什么需要：目标每次运行到约 16 秒都会弹出一个模态对话框（标题 Sky、标准 #32770、
+// 带「确定」按钮），随后**停在那里不再执行任何东西**（CPU 平坦、页面访问归零）。
+// 那说明它的检查发现了什么。把下面几项逐个关掉，就知道**是哪一项被它看到了**：
+//     GUADBG_SKIP_IAT=1    不补静态导入（这样 .idata 就不会与磁盘不同）
+//     GUADBG_SKIP_LDR=1    不补 PEB 的 Ldr 主模块条目
+//     GUADBG_SKIP_PEB=1    不改 PEB 的 ImageBase / ProcessParameters
+//     GUADBG_SKIP_HOOK=1   不钩 kernel32 的两个映像路径函数
+// 判据：关掉某一项之后那个对话框**不再出现**，则该项就是被它看到的差别。
+static int env_on(const char* name) {
+    char buf[8] = { 0 };
+    DWORD n = GetEnvironmentVariableA(name, buf, (DWORD)sizeof(buf));
+    return n > 0 && buf[0] != '0';
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         logf("usage: guadbg.exe <target.exe>\n");
@@ -4400,7 +4416,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (snap_imports(target_base) != 0) return 1;
+    if (env_on("GUADBG_SKIP_IAT")) {
+        logf("[!] GUADBG_SKIP_IAT：跳过静态导入补完（诊断用）\n");
+    } else if (snap_imports(target_base) != 0) return 1;
     // PLACEHOLDER_REMOVED
     // ---- 1b. 补一个 Ldr 条目，并采用映像头里的路径 ----
     //
@@ -4412,7 +4430,7 @@ int main(int argc, char** argv) {
     // `((PIMAGE_NT_HEADERS)base)->OptionalHeader.AddressOfEntryPoint` 交叉核对 Ldr 条目，
     // 而系统装载的 EXE 那条记录里 EntryPoint 指向的是**运行时包装**（kernel32!BaseThreadInitThunk
     // 附近），不是映像入口。填映像入口是与本引擎"寄生线程直接跳入口点"的执行模型一致的。
-    {
+    if (!env_on("GUADBG_SKIP_LDR")) {
         X_PEB_LDR_DATA* ldr = (X_PEB_LDR_DATA*)peb->Ldr;
         LIST_ENTRY* head = &ldr->InLoadOrderModuleList;
         bool present = false;
@@ -4479,6 +4497,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- 2. PEB 指向目标 ----
+    if (!env_on("GUADBG_SKIP_PEB")) {
     peb->ImageBaseAddress = target_base;
     {
         X_RTL_USER_PROCESS_PARAMETERS* pp = peb->ProcessParameters;
@@ -4498,6 +4517,7 @@ int main(int argc, char** argv) {
         pp->CommandLine.MaximumLength = (USHORT)clen;
         logf("[*] PEB ImageBase/ProcessParameters 已指向目标\n");
     }
+    }   // GUADBG_SKIP_PEB
 
     // ---- 3. 目标设备路径 ----
     //
@@ -4528,11 +4548,15 @@ int main(int argc, char** argv) {
     }
 
     // ---- 4. kernel32 转发 stub 钩子（映像路径伪装） ----
+    if (env_on("GUADBG_SKIP_HOOK")) {
+        logf("[!] GUADBG_SKIP_HOOK：跳过 kernel32 钩子（诊断用）\n");
+    } else {
     hook_pair_k32(hKernel32, "QueryFullProcessImageNameW",
         hk_queryfullprocessimagenamew, (PVOID*)&g_orig_qfpinw);
     hook_pair_k32(hKernel32, "K32GetProcessImageFileNameW",
         hk_k32getprocessimagefilenamew, (PVOID*)&g_orig_k32gpifn);
     logf("[*] 钩子安装完成（kernelbase/ntdll 全程未动）\n");
+    }
 
     // ---- 5. 系统断点（入口点断点）：默认在入口下一次性断点，便于附加即停 ----
     {
