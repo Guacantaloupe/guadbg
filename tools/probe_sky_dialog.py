@@ -403,8 +403,16 @@ def main():
                             print("    %5.2f 秒: %-26s %s"
                                   % (time.time() - t0, bpname[rip], pth[:150]))
                     else:
-                        print("    %5.2f 秒: %-26s （第 %d 次命中）"
-                              % (time.time() - t0, bpname[rip], nhit))
+                        # 没有路径可取（例如挂在 RtlEnterCriticalSection 上）：把参数打出来。
+                        # rcx 就是 CRITICAL_SECTION 指针 —— 想抓"哪把锁是空的"就看它。
+                        print("    %5.2f 秒: %-26s （第 %d 次命中）rcx=%s rdx=%s"
+                              % (time.time() - t0, bpname[rip], nhit,
+                                 regs.get("rcx"), regs.get("rdx")))
+                        if nhit <= 60:
+                            result.setdefault("bp_args", []).append(
+                                {"t": round(time.time() - t0, 2), "bp": bpname[rip],
+                                 "rcx": regs.get("rcx"), "rdx": regs.get("rdx"),
+                                 "rip": "%#x" % rip})
                     # **谁发的这次打开？** 立即返回地址 + 栈上前几个模块地址。
                     # 这一条直接决定下一步该钩什么：若调用者是保护层自己（栈在 .sky 里），
                     # 那"打开自己的映像文件来校验"这个假设就成立；若在 steam_api64 里，
@@ -518,6 +526,21 @@ def main():
                             # 更重要的：在整段栈里找**落在 Sky.exe 里的**返回地址 ——
                             # 那才是"游戏自己的代码在哪儿决定弹这个框"。
                             # （如果命中点是 user32/win32u 内部，直接返回地址只会指向 user32。）
+                            # 先来一份**任意模块**的栈扫描：'谁调进了这把锁'要看全栈，
+                            # 只过滤 Sky.exe 太窄 —— 第 150 轮那次崩溃栈顶是 0，什么也没看出来。
+                            mods_seen = []
+                            for i in range(0, 0x200 - 8, 8):
+                                q = int.from_bytes(raw[i:i + 8], "little")
+                                ww = where(q, mods) if mods else None
+                                if ww and len(mods_seen) < 8:
+                                    mods_seen.append((i, q, ww))
+                            if mods_seen:
+                                print("          栈上任意模块地址（前 8 个）：")
+                                for i, q, ww in mods_seen:
+                                    print("            [栈+%#x] %#x → %s" % (i, q, ww))
+                                result.setdefault("stack_any_mod", []).append(
+                                    [{"slot": i, "addr": "%#x" % q, "where": ww}
+                                     for i, q, ww in mods_seen])
                             game = []
                             for i in range(0, 0x200 - 8, 8):
                                 q = int.from_bytes(raw[i:i + 8], "little")
