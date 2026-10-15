@@ -101,6 +101,20 @@ def is_dialog(w):
     return False
 
 
+def as_int(v):
+    return v if isinstance(v, int) else int(str(v).strip(), 16)
+
+
+def where(addr, mods):
+    """把地址标成「模块+偏移」。"""
+    for mo in mods:
+        b = as_int(mo.get("base", 0))
+        sz = as_int(mo.get("size", 0))
+        if b and sz and b <= addr < b + sz:
+            return "%s+%#x" % (mo.get("name"), addr - b)
+    return None
+
+
 def main():
     secs = 40.0
     if "--secs" in sys.argv:
@@ -137,6 +151,44 @@ def main():
                       % (a, label,
                          ("%#x" % int(old)) if isinstance(old, (int, float)) else "?",
                          "" if r.get("error") is None else "  **失败: %s**" % r.get("error")))
+
+        # --hw-msgbox：在 user32 的三个 MessageBox 出口上挂**硬件执行**断点（不改一个字节）。
+        #
+        # 这是第 144 轮的正路：不再猜"关掉哪一步能躲过检查"，而是**直接抓做决定的那段代码** ——
+        # 它要弹框就必然经过 MessageBoxW / MessageBoxA / MessageBoxIndirectW 之一，
+        # 命中时的返回地址就是"判定游戏文件已损坏"的调用点（第 139 轮修好 Dr 之后才可行）。
+        mods = []
+        if "--hw-msgbox" in sys.argv or "--hw-candidates" in sys.argv:
+            # --hw-candidates：三个 MessageBox 出口**没有命中**（第 144 轮实测），说明这个对话框
+            # 不是由它们创建的。所以改堵"任何窗口都得经过"的那几个咽喉：
+            #   ntdll!NtRaiseHardError      —— 系统硬错误对话框就是 #32770 带确定按钮（很像）
+            #   user32!MessageBoxTimeoutW   —— 未文档化的 MessageBox 变体
+            #   user32!SoftModalMessageBox  —— user32 内部弹框
+            #   win32u!NtUserCreateWindowEx —— **所有**窗口创建的系统调用入口
+            if "--hw-candidates" in sys.argv:
+                want = [("ntdll.dll", ["NtRaiseHardError"]),
+                        ("user32.dll", ["MessageBoxTimeoutW", "SoftModalMessageBox"]),
+                        ("win32u.dll", ["NtUserCreateWindowEx"])]
+            else:
+                want = [("user32.dll", ["MessageBoxW", "MessageBoxA", "MessageBoxIndirectW"])]
+            mods = call("list_modules").get("result", {}).get("modules", []) or []
+            for mod, names in want:
+                ex = call("exports", {"module": mod}).get("result", {})
+                byname = {str(e.get("name", "")): e for e in (ex.get("exports") or [])
+                          if e.get("name")}
+                if not byname:
+                    print("    %s 取不到导出表（err=%s）" % (mod, ex.get("error")))
+                    continue
+                for nm in names:
+                    e = byname.get(nm)
+                    if not e:
+                        print("    %s 没有导出 %s" % (mod, nm))
+                        continue
+                    a = as_int(e.get("addr", e.get("address", 0)))
+                    r = call("set_hw_bp", {"addr": a, "size": 1, "mode": "execute"}).get("result", {})
+                    print("    硬件执行断点 %s!%s @ %#x -> %s"
+                          % (mod, nm, a, "id=%s" % r.get("id") if r.get("id") is not None
+                             else "**失败: %s**" % r.get("error")))
         call("resume")
 
         t0 = time.time()
@@ -144,6 +196,56 @@ def main():
         seen = None
         while time.time() - t0 < secs:
             time.sleep(1.5)
+            # 先看是不是命中了我们挂的断点（命中时引擎会停在 paused）
+            st2 = call("get_state").get("result", {})
+            if st2.get("state") == "paused":
+                rip = st2.get("rip", 0)
+                reason = str(st2.get("reason", ""))[:70]
+                regs = call("get_regs").get("result", {}).get("regs", {}) or {}
+                ins = call("disasm", {"addr": rip, "count": 3}).get("result", {}).get("lines", [])
+                print("    %5.1f 秒: **命中断点** rip=%#x reason=%s"
+                      % (time.time() - t0, rip, reason))
+                for i in ins:
+                    print("          %s" % i.get("text", i))
+                rsp = regs.get("rsp")
+                if rsp is not None:
+                    try:
+                        rsp = as_int(rsp)
+                        m = call("read_mem", {"addr": rsp, "len": 0x200}).get("result", {})
+                        hx = str(m.get("hex", "")).replace(" ", "")
+                        if m.get("len") == 0x200 and len(hx) == 0x400:
+                            raw = bytes.fromhex(hx)
+                            ra = int.from_bytes(raw[:8], "little")
+                            w = where(ra, mods) if mods else None
+                            print("          返回地址 = %#x  →  %s" % (ra, w or "（不在已知模块里）"))
+                            result["caller_return"] = "%#x" % ra
+                            result["caller_where"] = w
+                            # 更重要的：在整段栈里找**落在 Sky.exe 里的**返回地址 ——
+                            # 那才是"游戏自己的代码在哪儿决定弹这个框"。
+                            # （如果命中点是 user32/win32u 内部，直接返回地址只会指向 user32。）
+                            game = []
+                            for i in range(0, 0x200 - 8, 8):
+                                q = int.from_bytes(raw[i:i + 8], "little")
+                                ww = where(q, mods) if mods else None
+                                if ww and ww.lower().startswith("sky.exe"):
+                                    game.append((i, q, ww))
+                            if game:
+                                print("          栈上落在 Sky.exe 里的地址 %d 个：" % len(game))
+                                for i, q, ww in game[:6]:
+                                    print("            [栈+%#x] %#x → %s" % (i, q, ww))
+                                result["stack_game"] = [{"slot": i, "addr": "%#x" % q,
+                                                         "where": ww} for i, q, ww in game[:6]]
+                                d = call("disasm", {"addr": game[0][1] - 0x20,
+                                                    "count": 10}).get("result", {})
+                                print("            第一个调用点附近：")
+                                for ln in (d.get("lines") or []):
+                                    print("              %s" % ln.get("text", ln))
+                    except Exception as ex:
+                        print("          读栈失败: %s" % ex)
+                result.setdefault("hits", []).append({"t": round(time.time() - t0, 1),
+                                                      "rip": "%#x" % rip, "reason": reason})
+                call("resume")
+                continue
             if eng.poll() is not None:
                 print("    %5.1f 秒: **引擎进程已退出**（code=%r）" % (time.time() - t0, eng.poll()))
                 result["end"] = "process-exited"
