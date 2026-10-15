@@ -227,6 +227,12 @@ def main():
     poll = 1.5
     if "--poll" in sys.argv:
         poll = float(sys.argv[sys.argv.index("--poll") + 1])
+    # --del-after N：某个断点命中 N 次之后就把它删掉，让目标自由跑。
+    # 用途：拿一个**与检查无关**的函数当对照 —— 只挨几次陷阱，
+    # 这样"被拖慢"与"这个调用被停过"两件事就不会混在一起。
+    del_after = 0
+    if "--del-after" in sys.argv:
+        del_after = int(sys.argv[sys.argv.index("--del-after") + 1])
 
     switches = {k: v for k, v in os.environ.items()
                 if k.startswith("GUADBG_SKIP_")}
@@ -304,6 +310,8 @@ def main():
         # 要知道它在查什么，就得看它**读了什么**：若在校验磁盘文件，就会看到一串打开路径，
         # 以及"哪一个之后紧接着弹了框"；若一个文件都没开，那它校验的是内存/映像 —— 同样是收获。
         bpname = {}
+        bpid = {}
+        hitcount = {}
         if "--hw-file" in sys.argv:
             if not mods:
                 mods = call("list_modules").get("result", {}).get("modules", []) or []
@@ -323,6 +331,51 @@ def main():
                          else "**失败: %s**" % r.get("error")))
                 if r.get("id") is not None:
                     bpname[a] = "%s!%s" % (mod, nm)
+                    bpid[a] = r.get("id")
+
+        # --hw-one <模块!函数>（可重复多次）：每个都挂一个。
+        # 把"哪一个陷阱"与"任何陷阱"分开；也用来同时观察"取路径的 API"与"打开文件的 API"的先后。
+        for i, a0 in enumerate(sys.argv):
+            if a0 != "--hw-one" or i + 1 >= len(sys.argv):
+                continue
+            spec = sys.argv[i + 1]
+            if spec.startswith("--"):
+                continue
+            mod, _sep, nm = spec.partition("!")
+            if not mods:
+                mods = call("list_modules").get("result", {}).get("modules", []) or []
+            ex = call("exports", {"module": mod}).get("result", {})
+            byname = {str(e.get("name", "")): e for e in (ex.get("exports") or [])
+                      if e.get("name")}
+            e = byname.get(nm)
+            if not e:
+                print("    %s 没有导出 %s" % (mod, nm))
+                continue
+            a = as_int(e.get("addr", e.get("address", 0)))
+            r = call("set_hw_bp", {"addr": a, "size": 1, "mode": "execute"}).get("result", {})
+            print("    硬件执行断点 %s!%s @ %#x -> %s"
+                  % (mod, nm, a, "id=%s" % r.get("id") if r.get("id") is not None
+                     else "**失败: %s**" % r.get("error")))
+            if r.get("id") is not None:
+                bpname[a] = "%s!%s" % (mod, nm)
+                bpid[a] = r.get("id")
+
+        # --manual-pause：**对照实验** —— 不用任何断点，只像陷阱那样把目标停一小会儿。
+        #
+        # 目的：把"挂住那次 CreateFileW 之后对话框就不出现"的两种解释分开：
+        #   若**任何暂停**都足以抑制对话框 ⇒ 之前那些"零命中/零访问"都被这个效应污染了；
+        #   若手动暂停后对话框照弹 ⇒ 抑制是**那一次调用**特有的（说明它在检查路径上）。
+        if "--manual-pause" in sys.argv:
+            tp = time.time()
+            for when in (0.2, 1.0):
+                while time.time() - tp < when:
+                    time.sleep(0.02)
+                r = call("pause").get("result", {})
+                time.sleep(0.15)
+                call("resume")
+                print("    %.1f 秒: 手动暂停 0.15 秒（无断点，纯对照）%s"
+                      % (when, "" if r.get("error") is None
+                         else "  **pause 失败: %s**" % r.get("error")))
         call("resume")
 
         t0 = time.time()
@@ -337,7 +390,9 @@ def main():
                 reason = str(st2.get("reason", ""))[:70]
                 regs = call("get_regs").get("result", {}).get("regs", {}) or {}
                 if rip in bpname:
-                    # 文件访问断点：记下路径就继续，不走下面 MessageBox 那套
+                    # 文件/对照断点：记下路径（若取得出）就继续，不走下面 MessageBox 那套
+                    nhit = hitcount.get(rip, 0) + 1
+                    hitcount[rip] = nhit
                     pth = path_from_hit(bpname[rip], regs)
                     if pth:
                         tr = result.setdefault("file_trace", [])
@@ -345,6 +400,42 @@ def main():
                             tr.append(pth)
                             print("    %5.2f 秒: %-26s %s"
                                   % (time.time() - t0, bpname[rip], pth[:150]))
+                    else:
+                        print("    %5.2f 秒: %-26s （第 %d 次命中）"
+                              % (time.time() - t0, bpname[rip], nhit))
+                    # **谁发的这次打开？** 立即返回地址 + 栈上前几个模块地址。
+                    # 这一条直接决定下一步该钩什么：若调用者是保护层自己（栈在 .sky 里），
+                    # 那"打开自己的映像文件来校验"这个假设就成立；若在 steam_api64 里，
+                    # 那就是 Steam 在校验，方向完全不同。
+                    if mods and regs.get("rsp") is not None:
+                        try:
+                            rspv = as_int(regs["rsp"])
+                            m = call("read_mem", {"addr": rspv, "len": 0x100}).get("result", {})
+                            hx = str(m.get("hex", "")).replace(" ", "")
+                            if m.get("len") == 0x100 and len(hx) == 0x200:
+                                raw = bytes.fromhex(hx)
+                                ret = int.from_bytes(raw[:8], "little")
+                                print("          调用者: 立即返回 %#x → %s"
+                                      % (ret, where(ret, mods) or "（不在已知模块里）"))
+                                seen = []
+                                for i in range(8, 0x100 - 8, 8):
+                                    q = int.from_bytes(raw[i:i + 8], "little")
+                                    wq = where(q, mods)
+                                    if wq and len(seen) < 5:
+                                        seen.append((i, q, wq))
+                                for i, q, wq in seen:
+                                    print("            [栈+%#x] %#x → %s" % (i, q, wq))
+                                if nhit == 1:
+                                    result.setdefault("file_caller", []).append(
+                                        {"ret": "%#x" % ret, "where": where(ret, mods),
+                                         "stack": [{"slot": i, "addr": "%#x" % q, "where": wq}
+                                                   for i, q, wq in seen]})
+                        except Exception as ex:
+                            print("          读栈失败: %s" % ex)
+                    if del_after and nhit >= del_after and bpid.get(rip):
+                        call("del_bp", {"id": bpid[rip]})
+                        print("          已删除该断点（--del-after %d），目标就此自由跑"
+                              % del_after)
                     call("resume")
                     continue
                 ins = call("disasm", {"addr": rip, "count": 3}).get("result", {}).get("lines", [])

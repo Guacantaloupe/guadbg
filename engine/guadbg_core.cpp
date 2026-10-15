@@ -4323,6 +4323,56 @@ static DWORD WINAPI hk_k32getprocessimagefilenamew(HANDLE hProcess, LPWSTR lpFil
     return 0;
 }
 
+// ---- GetModuleFileNameW/A：保护层"取自己文件"用的就是它 ----
+//
+// 第 148 轮用硬件断点抓到：保护层在循环里反复调 GetModuleFileNameW
+// （调用点 Sky.exe+0x2c235ba，在 .sky[1] 的混淆代码里），随后 CreateFileW 打开的却是
+// **guadbg.exe** —— 因为在这个进程里真正"创建进程的映像"是我们自己。
+// 它拿这个路径去校验，"自己的文件"当然是错的，于是弹「核心游戏文件已损坏」。
+// 引擎原先只钩了 QueryFullProcessImageNameW 与 K32GetProcessImageFileNameW，漏了这一对。
+typedef DWORD(WINAPI* PFN_GetModuleFileNameW)(HMODULE, LPWSTR, DWORD);
+typedef DWORD(WINAPI* PFN_GetModuleFileNameA)(HMODULE, LPSTR, DWORD);
+static PFN_GetModuleFileNameW g_orig_gmfnw = NULL;
+static PFN_GetModuleFileNameA g_orig_gmfna = NULL;
+static int g_gmfn_logged = 0;
+
+static DWORD WINAPI hk_getmodulefilenamew(HMODULE hModule, LPWSTR lpFilename, DWORD nSize) {
+    if (lpFilename && nSize && hModule == NULL) {
+        SIZE_T n = wcslen(g_target_path);
+        if (g_gmfn_logged < 20) {
+            g_gmfn_logged++;
+            logf("[i] GetModuleFileNameW(NULL) -> 目标路径（第 %d 次）\n", g_gmfn_logged);
+        }
+        if (n + 1 > nSize) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return nSize; }
+        memcpy(lpFilename, g_target_path, (n + 1) * sizeof(WCHAR));
+        return (DWORD)n;
+    }
+    if (g_orig_gmfnw) return g_orig_gmfnw(hModule, lpFilename, nSize);
+    SetLastError(ERROR_INVALID_HANDLE);
+    return 0;
+}
+
+static DWORD WINAPI hk_getmodulefilenamea(HMODULE hModule, LPSTR lpFilename, DWORD nSize) {
+    if (lpFilename && nSize && hModule == NULL) {
+        char narrow[MAX_PATH * 2];
+        int n = WideCharToMultiByte(CP_ACP, 0, g_target_path, -1, narrow,
+                                    (int)sizeof(narrow), NULL, NULL);
+        if (n > 0) {
+            SIZE_T len = (SIZE_T)(n - 1);
+            if (g_gmfn_logged < 20) {
+                g_gmfn_logged++;
+                logf("[i] GetModuleFileNameA(NULL) -> 目标路径（第 %d 次）\n", g_gmfn_logged);
+            }
+            if (len + 1 > nSize) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return nSize; }
+            memcpy(lpFilename, narrow, len + 1);
+            return (DWORD)len;
+        }
+    }
+    if (g_orig_gmfna) return g_orig_gmfna(hModule, lpFilename, nSize);
+    SetLastError(ERROR_INVALID_HANDLE);
+    return 0;
+}
+
 static void hook_pair_k32(HMODULE k32, const char* name, PVOID handler, PVOID* tramp_slot) {
     PVOID p = mem_find_export(k32, name);
     if (!p) { logf("[-] kernel32!%s 未导出\n", name); return; }
@@ -4574,6 +4624,17 @@ int main(int argc, char** argv) {
         hk_queryfullprocessimagenamew, (PVOID*)&g_orig_qfpinw);
     hook_pair_k32(hKernel32, "K32GetProcessImageFileNameW",
         hk_k32getprocessimagefilenamew, (PVOID*)&g_orig_k32gpifn);
+    // 保护层"取自己文件"走的是这一对（第 148 轮抓到），不钩它就会拿到 guadbg.exe。
+    // **默认关闭**：加上它之后那一次运行里目标（2.3 秒）与引擎（14.9 秒）都以 0xC0000005 崩了，
+    // 所以它现在是"待隔离的实验改动"，**不是已修好的东西**。用 GUADBG_GMNF=1 打开。
+    if (env_on("GUADBG_GMNF")) {
+        hook_pair_k32(hKernel32, "GetModuleFileNameW", hk_getmodulefilenamew,
+            (PVOID*)&g_orig_gmfnw);
+        hook_pair_k32(hKernel32, "GetModuleFileNameA", hk_getmodulefilenamea,
+            (PVOID*)&g_orig_gmfna);
+    } else {
+        logf("[!] GetModuleFileNameW/A 钩子默认关闭（GUADBG_GMNF=1 打开；打开后曾导致 0xC0000005）\n");
+    }
     logf("[*] 钩子安装完成（kernelbase/ntdll 全程未动）\n");
     }
 
