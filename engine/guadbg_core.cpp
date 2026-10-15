@@ -2476,6 +2476,20 @@ static void hw_apply_all(void) {
             }
             c.Dr6 = 0;
             SetThreadContext(h, &c);
+            // **关键**：如果这个线程正是"停在 VEH 里"的那一个，只写 SetThreadContext 是不够的 ——
+            // 从异常恢复时，内核会用 ep->ContextRecord（即 g_pctx）来安装上下文，
+            // 把刚写进去的 Dr 全部抹回旧值（旧值是 0）。
+            //
+            // 实测（第 139 轮）：在**入口**挂硬件执行断点，30 秒**零命中**而进程照常运行 ——
+            // 入口是恢复后执行的第一条指令，所以那次零命中不可能是"没执行到"，
+            // 只能是"断点没生效"。原因就是这条"写进去又被覆盖"。
+            if (g_pctx && tids[i] == g_paused_tid) {
+                g_pctx->Dr0 = c.Dr0; g_pctx->Dr1 = c.Dr1;
+                g_pctx->Dr2 = c.Dr2; g_pctx->Dr3 = c.Dr3;
+                g_pctx->Dr6 = c.Dr6; g_pctx->Dr7 = c.Dr7;
+                logf("[*]   tid %lu: 已同时写入暂停上下文（否则 resume 会抹掉 Dr）\n",
+                     (unsigned long)tids[i]);
+            }
         }
         ResumeThread(h);
         CloseHandle(h);

@@ -159,7 +159,9 @@ def main():
             raise SystemExit(0)
 
         print("  --- 只用硬件执行断点（不改任何字节）---")
-        for mod, names in WANT:
+        # --no-default-bps：不挂默认那四个（MessageBoxW/A/IndirectW + NtTerminateProcess）。
+        # 需要它是因为 Dr 只有 4 个槽：要把槽用在"抓某个地址的写者"上时，这四个就必须让位。
+        for mod, names in (WANT if "--no-default-bps" not in sys.argv else []):
             ex = call("exports", {"module": mod}).get("result", {})
             arr = ex.get("exports", []) or []
             if not arr:
@@ -184,8 +186,48 @@ def main():
                                       "id": r.get("id"), "error": r.get("error")})
                 if not ok:
                     problems.append("set_hw_bp 失败 %s!%s" % (mod, nm))
+        # --hw-write <addr>（可重复）：在给定地址上挂**硬件写**断点。
+        #
+        # 为什么用它而不是保护页：.sky[1] 的第一页里装着 PE 入口，代码就在那一页上跑，
+        # 保护页会连**取指**一起抓（读也会命中），于是记录被淹没而且每次都要停一下。
+        # 硬件写断点只对**写**触发，正好用来找"谁改了那 5 个字节"。
+        hw_writes = [int(sys.argv[i + 1], 0) for i, a in enumerate(sys.argv)
+                     if a == "--hw-write" and i + 1 < len(sys.argv)]
+        for a in hw_writes:
+            r = call("set_hw_bp", {"addr": a, "size": 4, "mode": "write"}).get("result", {})
+            ok = (r.get("error") is None) and r.get("id") is not None
+            print("  硬件写断点 @ %#x -> %s" % (a, "id=%s" % r.get("id") if ok
+                                             else "**失败: %s**" % r.get("error")))
+            result["bps"].append({"module": "-", "name": "hw-write", "addr": "%#x" % a,
+                                  "id": r.get("id"), "error": r.get("error")})
+            if not ok:
+                problems.append("set_hw_bp(write) 失败 @ %#x: %s" % (a, r.get("error")))
+        if hw_writes:
+            print("  （共 %d 个硬件写断点，用于抓某几个字节的写者）" % len(hw_writes))
+
+        # --hw-exec <addr>（可重复）：硬件**执行**断点。
+        # 诊断用途：用来回答"这台引擎里硬件断点到底会不会命中" ——
+        # 因为到目前为止，本项目所有抓到的命中都来自软件断点或保护页，
+        # 而**没有一个硬件断点命中过**。若连入口都抓不到，那 Dr 就是没生效。
+        hw_execs = [int(sys.argv[i + 1], 0) for i, a in enumerate(sys.argv)
+                    if a == "--hw-exec" and i + 1 < len(sys.argv)]
+        for a in hw_execs:
+            r = call("set_hw_bp", {"addr": a, "size": 1, "mode": "execute"}).get("result", {})
+            ok = (r.get("error") is None) and r.get("id") is not None
+            print("  硬件执行断点 @ %#x -> %s" % (a, "id=%s" % r.get("id") if ok
+                                               else "**失败: %s**" % r.get("error")))
+            result["bps"].append({"module": "-", "name": "hw-exec", "addr": "%#x" % a,
+                                  "id": r.get("id"), "error": r.get("error")})
+            if not ok:
+                problems.append("set_hw_bp(exec) 失败 @ %#x: %s" % (a, r.get("error")))
+
+        # 这条检查必须放在**两种断点都挂完之后**：--no-default-bps 时前面那批是空的，
+        # 若仍放在前面，就会在什么都没挂的情况下误报并**静默 exit 1**（本轮实际踩到）。
+        # 同时这里把 problems 打出来 —— 早退路径不打印诊断，就等于一次"什么都没说"的失败。
         if not any(b.get("id") for b in result["bps"]):
             problems.append("一个硬件断点都没挂上，后面的'没命中'没有意义")
+            for p in problems:
+                print("    - %s" % p)
             return 1
 
         # ---- --watch：只挂 Dr，长跑，**不提前终止** ----
