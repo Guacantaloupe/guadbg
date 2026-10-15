@@ -188,6 +188,125 @@ def main():
             problems.append("一个硬件断点都没挂上，后面的'没命中'没有意义")
             return 1
 
+        # ---- --watch：只挂 Dr，长跑，**不提前终止** ----
+        #
+        # 为什么需要它：前三次实验都只给了 8~150 秒，而且探针结束时会 terminate 掉游戏。
+        # 所以"那个对话框由什么触发"这个问题一直没有被真正问过 —— 有可能它需要游戏
+        # 跑到**更晚的阶段**才校验，而我们从来没让它跑到那里（候选 3）。
+        # 这个模式就是去分辨这一件事：Dr 网挂好，然后**让它一直跑**，命中就记录并继续。
+        if "--watch" in sys.argv:
+            print()
+            print("  === --watch：只挂 Dr（不写任何字节），长跑 %.0f 秒，命中就记下并继续 ==="
+                  % wait_s)
+            # 可选：在**游戏自己的映像**里下一个 0xCC。
+            #
+            # 为什么是这里而不是系统模块：第 135 轮把 0xCC 打进 kernel32/kernelbase/ntdll
+            # **什么都没发生**（60 秒）。反过来，第 131~132 轮在 .sky 里下过 0xCC 的那几次，
+            # 都以 0xC0000026 风暴 + 进程退出收场。所以"它查的是自己的映像字节"比
+            # "它查系统模块"更符合已有的全部观测。这个开关就是去分辨这件事。
+            if "--patch-sky" in sys.argv:
+                i = sys.argv.index("--patch-sky")
+                skypatch = 0x142C04B26
+                if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--"):
+                    skypatch = int(sys.argv[i + 1], 0)
+                r = call("set_bp", {"addr": skypatch}).get("result", {})
+                ok = (r.get("error") is None) and r.get("id") is not None
+                print("  **故意触发**：在游戏自己的映像里下 0xCC @ %#x -> %s"
+                      % (skypatch, "id=%s" % r.get("id") if ok
+                         else "**失败: %s**" % r.get("error")))
+                if ok:
+                    result["sky_patch_bp"] = "%#x" % skypatch
+                else:
+                    problems.append("--patch-sky 的 set_bp 失败: %s" % r.get("error"))
+            # 可选：挂保护页（改页属性，**不改字节**）。
+            #
+            # 为什么要单独试它：把"会死的那些运行"与"活下来的那些运行"逐项对照之后，
+            # 剩下的唯一差别就是**保护页**——
+            #     第 130~132 轮（死）：.sky 里 0xCC **＋ 保护页**
+            #     第 136 轮  （活）：.sky 里 0xCC，**没有保护页**
+            # 所以这一条是当前最可疑的那一个，而它又是可以单独试的。
+            if "--guard-sky" in sys.argv:
+                i = sys.argv.index("--guard-sky")
+                gaddr = 0x142B56000
+                if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--"):
+                    gaddr = int(sys.argv[i + 1], 0)
+                r = call("set_mem_bp", {"addr": gaddr, "size": 0x1000}).get("result", {})
+                ok = (r.get("error") is None) and r.get("id") is not None
+                print("  **故意触发（保护页）**：%#x 一页 -> %s"
+                      % (gaddr, "id=%s" % r.get("id") if ok
+                         else "**失败: %s**" % r.get("error")))
+                if ok:
+                    result["sky_guard"] = "%#x" % gaddr
+                else:
+                    problems.append("--guard-sky 的 set_mem_bp 失败: %s" % r.get("error"))
+            call("resume")
+            t0 = time.time()
+            last_note = 0.0
+            while time.time() - t0 < wait_s:
+                time.sleep(2)
+                s = call("get_state").get("result", {})
+                st = s.get("state")
+                if st is None:
+                    print("    %5.0f 秒: **引擎已不应答（管道断了）** —— 进程消失"
+                          % (time.time() - t0))
+                    result["watch_end"] = "pipe-closed"
+                    break
+                if st == "paused":
+                    rip = s.get("rip", 0)
+                    reason = str(s.get("reason", ""))[:70]
+                    regs = call("get_regs").get("result", {}).get("regs", {}) or {}
+                    ins = call("disasm", {"addr": rip, "count": 3}).get("result", {}).get("lines", [])
+                    hit = {"n": len(result["hits"]) + 1, "phase": "watch",
+                           "t": round(time.time() - t0, 1),
+                           "rip": "%#x" % rip, "reason": reason,
+                           "insns": [i.get("text", str(i)) for i in ins][:3]}
+                    rsp = regs.get("rsp")
+                    if rsp is not None:
+                        try:
+                            rsp = as_int(rsp)
+                            m = call("read_mem", {"addr": rsp, "len": 0x80}).get("result", {})
+                            hx = str(m.get("hex", "")).replace(" ", "")
+                            if m.get("len") == 0x80 and len(hx) == 0x100:
+                                raw = bytes.fromhex(hx)
+                                qs = [int.from_bytes(raw[i:i + 8], "little")
+                                      for i in range(0, 0x80, 8)]
+                                lb = []
+                                for idx, q in enumerate(qs[:10]):
+                                    w = where(q, mods, base) if base else None
+                                    if w:
+                                        lb.append({"slot_index": idx, "addr": "%016x" % q,
+                                                   "where": w, "is_return": idx == 0})
+                                hit["stack_in_modules"] = lb
+                        except Exception as ex:
+                            hit["stack_error"] = str(ex)
+                    result["hits"].append(hit)
+                    print("    %5.0f 秒: **命中** rip=%#x reason=%s"
+                          % (time.time() - t0, rip, reason))
+                    for i in hit["insns"]:
+                        print("           %s" % i)
+                    for e in (hit.get("stack_in_modules") or [])[:5]:
+                        print("           [%d] %s → %s%s"
+                              % (e["slot_index"], e["addr"], e["where"],
+                                 "   **← 返回地址（做决定的代码）**" if e["is_return"] else ""))
+                    call("resume")
+                    continue
+                # st == 'running'：每 60 秒报一次，证明它确实在跑而不是僵住
+                if time.time() - t0 - last_note >= 60:
+                    last_note = time.time() - t0
+                    print("    %5.0f 秒: state=running（仍然活着，没有命中，没有对话框）"
+                          % last_note)
+            s = call("get_state").get("result", {})
+            print("    结束 state=%r · 命中 %d 次" % (s.get("state"), len(result["hits"])))
+            result["watch_end"] = s.get("state")
+            if not result["hits"]:
+                print("    ⇒ %.0f 秒里 Dr 网零命中：它**没有**调用 MessageBoxW/A/IndirectW，"
+                      "也**没有**调用 NtTerminateProcess。" % wait_s)
+                print("      而进程仍然活着 —— 所以候选 3（需要更晚阶段）在本窗口内"
+                      "**没有被证实**，同时也没有被排除（窗口还不够长）。")
+            json.dump(result, open(OUT, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+            print("    -> %s" % OUT)
+            raise SystemExit(0)
+
         print()
         for n in range(hits_want):
             call("resume")
