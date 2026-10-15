@@ -428,6 +428,31 @@ def main():
             else:
                 problems.append("set_hw_bp(裸地址) 失败 @ %#x: %s" % (a, r.get("error")))
 
+        # --sw-bp <addr>（可重复）：挂**软件**断点（写 0xCC）。
+        #
+        # 为什么此时该用它：硬件执行断点只有 4 个槽，而且第 141/144/161 轮都看到
+        # "同一地址重复命中、寄存器一模一样" —— 那更像目标**没跨过那条指令**。
+        # 而软件断点这条路在本项目里一直是能"停一次、继续跑"的（第 136 轮起多次验证），
+        # 且 MAX_BP=256，可以一次把整条调用链都挂上。
+        # 代价：它改字节（0xCC），所以在会被完整性检查盯上的配置里可能被抹掉 —— 那也算信息。
+        for i, a0 in enumerate(sys.argv):
+            if a0 != "--sw-bp" or i + 1 >= len(sys.argv):
+                continue
+            spec = sys.argv[i + 1]
+            if spec.startswith("--"):
+                continue
+            a = int(spec, 0)
+            if not mods:
+                mods = call("list_modules").get("result", {}).get("modules", []) or []
+            r = call("set_bp", {"addr": a}).get("result", {})
+            if r.get("error") is None and r.get("id") is not None:
+                print("    软件断点 @ %#x -> id=%s" % (a, r.get("id")))
+                bpname[a] = "sw@%#x" % a
+                bpid[a] = r.get("id")
+            else:
+                print("    软件断点 @ %#x **失败: %s**" % (a, r.get("error")))
+                problems.append("set_bp 失败 @ %#x: %s" % (a, r.get("error")))
+
         # --manual-pause：**对照实验** —— 不用任何断点，只像陷阱那样把目标停一小会儿。
         #
         # 目的：把"挂住那次 CreateFileW 之后对话框就不出现"的两种解释分开：
