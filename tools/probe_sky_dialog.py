@@ -897,7 +897,11 @@ def main():
                         result.setdefault("read_at", []).append(
                             {"addr": "%#x" % a_r, "len": l_r, "hex": hx})
                 # --stack-chain：把**验证过的返回地址**列出来（问"谁调用到这里"）
-                if stack_chain and not result.get("chain_done") and mods:
+                # --stack-chain：从 rsp 往上扫**验证过的返回地址**。
+                # 默认只在**第一次**暂停时做一次；加 `--stack-chain-each` 则**每次暂停都做** ——
+                # 第 198 轮要的正是"**崩溃那一次**"的栈（第一次暂停是入口断点，栈上什么都没用）。
+                if stack_chain and ("--stack-chain-each" in sys.argv
+                                    or not result.get("chain_done")) and mods:
                     result["chain_done"] = True
                     ch = print_stack_chain(regs, mods, stack_chain)
                     result["stack_chain"] = [{"slot": "%#x" % s, "ret": "%#x" % q,
