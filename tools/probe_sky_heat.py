@@ -78,6 +78,14 @@ def main():
     phase = 0    # 抽样起点在被取样的 stride 里的相位（配合不同的 --phase 可补洞）
     if "--phase" in sys.argv:
         phase = int(sys.argv[sys.argv.index("--phase") + 1])
+    # --base / --len：采样**任意区域**（默认 .sky[1]）。
+    # 需要它是因为一个关键假设必须被检验：.sky 可能只是早期 stub，之后游戏从 .text 跑。
+    region = BASE + SKY1
+    rlen = SKY1_LEN
+    if "--base" in sys.argv:
+        region = int(sys.argv[sys.argv.index("--base") + 1], 0)
+    if "--len" in sys.argv:
+        rlen = int(sys.argv[sys.argv.index("--len") + 1], 0)
     max_pages = 250
     if "--max-pages" in sys.argv:
         max_pages = int(sys.argv[sys.argv.index("--max-pages") + 1])
@@ -94,8 +102,8 @@ def main():
             return 1
 
         # 采样页：.sky[1] 每 stride 页取一页（--max-pages 可限流，用于**按规模二分**）
-        sample = [BASE + SKY1 + off for off in range(phase * PG, SKY1_LEN, PG * stride)][:max_pages]
-        print("  .sky[1] %d 页中抽样 %d 页（每 %d 页取 1）" % (SKY1_LEN // PG, len(sample), stride))
+        sample = [region + off for off in range(phase * PG, rlen, PG * stride)][:max_pages]
+        print("  区域 %#x 共 %d 页中抽样 %d 页（每 %d 页取 1）" % (region, rlen // PG, len(sample), stride))
         print("  对照页 %d 个（第 138 轮已证明它们必然被访问）" % len(CONTROLS))
 
         addr2id = {}
@@ -171,19 +179,19 @@ def main():
         vals = [(a, got.get(a)) for a in sample if got.get(a)]
         hit_pages = len(vals)
         print()
-        print("  == .sky[1] 抽样 %d 页中，被访问过的 %d 页 ==" % (len(sample), hit_pages))
+        print("  == 区域 %#x 抽样 %d 页中，被访问过的 %d 页 ==" % (region, len(sample), hit_pages))
         print("     （抽样是每 %d 页取 1，所以全段被访问页的估计 ≈ %d 页 / %d 页）"
-              % (stride, hit_pages * stride, SKY1_LEN // PG))
+              % (stride, hit_pages * stride, rlen // PG))
         tot = sum(v for _, v in vals) or 0
         print("     抽样命中总数 %d" % tot)
         if vals:
             print("     最热的 10 页：")
             for a, v in sorted(vals, key=lambda kv: -kv[1])[:10]:
-                off = a - BASE - SKY1
-                print("       .sky[1]+%#08x  %6d  (页 %d)" % (off, v, off // PG))
-            offs = sorted(a - BASE - SKY1 for a, _ in vals)
+                off = a - region
+                print("       区域+%#08x  %6d  (页 %d)" % (off, v, off // PG))
+            offs = sorted(a - region for a, _ in vals)
             print("     被访问页的偏移范围: %#x .. %#x" % (offs[0], offs[-1]))
-        result["pages"] = {"%#x" % (a - BASE - SKY1): v for a, v in vals}
+        result["pages"] = {"%#x" % (a - region): v for a, v in vals}
         result["sampled"] = len(sample)
         result["hit_pages"] = hit_pages
     finally:
