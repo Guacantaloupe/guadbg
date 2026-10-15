@@ -3365,6 +3365,25 @@ static jval* cmd_dispatch(const char* cmd, jval* args, jval* result) {
         jv_put(result, "windows_scanned", jv_num((double)ntrunc));
     }
 
+    else if (!strcmp(cmd, "set_prot")) {
+        // 诊断用：改一段内存的保护，并回报旧值。
+        // 目的：验证"我们留下的两处放宽写权限（.idata=RW、入口页=RWX）是不是被目标看到了" ——
+        // 不必改加载器代码，就能在入口暂停时先把这两页恢复成加载器的值（WC / WCX）再放行。
+        ULONG_PTR pa = (ULONG_PTR)jv_numval(args, "addr", 0);
+        SIZE_T psz = (SIZE_T)jv_numval(args, "size", 0);
+        DWORD ppr = (DWORD)jv_numval(args, "protect", 0);
+        if (!pa || !psz) { jv_put(result, "error", jv_str("缺少 addr/size")); return result; }
+        DWORD pold = 0;
+        if (!VirtualProtect((PVOID)pa, psz, ppr, &pold)) {
+            jv_put(result, "error", jv_str("VirtualProtect 失败"));
+            jv_put(result, "win32", jv_num((double)GetLastError()));
+            return result;
+        }
+        jv_put(result, "old_protect", jv_num((double)pold));
+        jv_put(result, "addr", jv_num((double)pa));
+        jv_put(result, "size", jv_num((double)psz));
+        jv_put(result, "protect", jv_num((double)ppr));
+    }
     else if (!strcmp(cmd, "mem_map")) {
         jval* arr = jv_new(4);
         ULONG_PTR a = 0;

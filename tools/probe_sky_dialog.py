@@ -122,6 +122,21 @@ def main():
             for p in problems:
                 print("    - %s" % p)
             return 1
+        # --fix-prot：放行之前，把我们留下的两处"放宽的写权限"恢复成加载器的值。
+        #
+        # 依据第 143 轮的逐段对照：正常装载下 .idata 是 WC、.sky[1] 入口页是 WCX，
+        # 而我们这边分别是 RW 与 RWX（入口页那处来自引擎每次都要下的 0xCC 系统断点）。
+        # WCX 本来就是写时复制、允许写，所以写 0xCC 并不需要把页放宽成 RWX。
+        # 这次实验就是用 set_prot 把这两页先恢复，再放行，看对话框还在不在。
+        if "--fix-prot" in sys.argv:
+            for a, sz, pr, label in ((0x142B60000, 0x1000, 0x08, ".idata -> WC"),
+                                     (0x142B64000, 0x1000, 0x80, "入口页 -> WCX")):
+                r = call("set_prot", {"addr": a, "size": sz, "protect": pr}).get("result", {})
+                old = r.get("old_protect")
+                print("    set_prot %#x（%s）: 旧值=%s%s"
+                      % (a, label,
+                         ("%#x" % int(old)) if isinstance(old, (int, float)) else "?",
+                         "" if r.get("error") is None else "  **失败: %s**" % r.get("error")))
         call("resume")
 
         t0 = time.time()
