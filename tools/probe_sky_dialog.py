@@ -362,6 +362,29 @@ def main():
                 bpname[a] = "%s!%s" % (mod, nm)
                 bpid[a] = r.get("id")
 
+        # --hw-rw <addr>（可重复）：在给定地址挂**读写**断点（Dr 的 mode=rw）。
+        #
+        # 用途：第 154 轮证明"线性反汇编答不了'谁读了 .sky[1] 里那张 .pdata 副本表'"
+        # （混淆代码跳进指令中间，97% 覆盖率全是垃圾解码）。于是改问运行时：
+        # 在那张表的几个位置上挂读写断点，命中时的**返回地址**就是读它的代码。
+        # 注意 x86 的 Dr 没有"只读"这一档：RW=11 是读或写，所以写也会命中（表一般是只读的）。
+        for i, a0 in enumerate(sys.argv):
+            if a0 != "--hw-rw" or i + 1 >= len(sys.argv):
+                continue
+            spec = sys.argv[i + 1]
+            if spec.startswith("--"):
+                continue
+            a = int(spec, 0)
+            if not mods:
+                mods = call("list_modules").get("result", {}).get("modules", []) or []
+            r = call("set_hw_bp", {"addr": a, "size": 8, "mode": "rw"}).get("result", {})
+            print("    硬件读写断点 @ %#x -> %s"
+                  % (a, "id=%s" % r.get("id") if r.get("id") is not None
+                     else "**失败: %s**" % r.get("error")))
+            if r.get("id") is not None:
+                bpname[a] = "rw@%#x" % a
+                bpid[a] = r.get("id")
+
         # --manual-pause：**对照实验** —— 不用任何断点，只像陷阱那样把目标停一小会儿。
         #
         # 目的：把"挂住那次 CreateFileW 之后对话框就不出现"的两种解释分开：
@@ -403,11 +426,28 @@ def main():
                             print("    %5.2f 秒: %-26s %s"
                                   % (time.time() - t0, bpname[rip], pth[:150]))
                     else:
-                        # 没有路径可取（例如挂在 RtlEnterCriticalSection 上）：把参数打出来。
-                        # rcx 就是 CRITICAL_SECTION 指针 —— 想抓"哪把锁是空的"就看它。
+                        # 没有路径可取（例如挂在 RtlEnterCriticalSection 或表地址上）：
+                        # 把参数打出来，并把**立即返回地址**解析成模块+偏移 —— 那才是"谁"。
                         print("    %5.2f 秒: %-26s （第 %d 次命中）rcx=%s rdx=%s"
                               % (time.time() - t0, bpname[rip], nhit,
                                  regs.get("rcx"), regs.get("rdx")))
+                        if regs.get("rsp") is not None and mods:
+                            try:
+                                rspv = as_int(regs["rsp"])
+                                m0 = call("read_mem", {"addr": rspv, "len": 0x40}).get("result", {})
+                                hx0 = str(m0.get("hex", "")).replace(" ", "")
+                                if m0.get("len") == 0x40 and len(hx0) == 0x80:
+                                    r0 = bytes.fromhex(hx0)
+                                    ra0 = int.from_bytes(r0[:8], "little")
+                                    print("          立即返回 %#x → %s"
+                                          % (ra0, where(ra0, mods) or "（不在已知模块里）"))
+                                    if ra0:
+                                        dd = call("disasm", {"addr": ra0 - 0x20,
+                                                             "count": 6}).get("result", {})
+                                        for ln in (dd.get("lines") or []):
+                                            print("            %s" % ln.get("text", ln))
+                            except Exception as ex:
+                                print("          读栈失败: %s" % ex)
                         if nhit <= 60:
                             result.setdefault("bp_args", []).append(
                                 {"t": round(time.time() - t0, 2), "bp": bpname[rip],
