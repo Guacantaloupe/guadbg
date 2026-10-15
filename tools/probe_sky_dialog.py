@@ -329,6 +329,10 @@ def main():
     log_bps = set()
     log_since = 0
     threads_at = 0.0
+    thread_walk = 0x200
+    if "--thread-walk" in sys.argv:
+        i = sys.argv.index("--thread-walk")
+        thread_walk = int(sys.argv[i + 1], 0) if i + 1 < len(sys.argv) else 0x200
     if "--threads-at" in sys.argv:
         i = sys.argv.index("--threads-at")
         threads_at = float(sys.argv[i + 1]) if i + 1 < len(sys.argv) else 10.0
@@ -706,7 +710,7 @@ def main():
                                   % " ".join("%#x" % x for x in qs))
                     # **哪儿的代码在跑**：直接走这条线程的栈，只列验证过的返回地址并归属模块
                     if r:
-                        ch = print_stack_chain(r, mods, 0x200)
+                        ch = print_stack_chain(r, mods, thread_walk)
                         for slot, q, wq in ch:
                             txt = wq
                             if wq and wq.lower().startswith("sky.exe"):
