@@ -4335,6 +4335,15 @@ typedef DWORD(WINAPI* PFN_GetModuleFileNameW)(HMODULE, LPWSTR, DWORD);
 typedef DWORD(WINAPI* PFN_GetModuleFileNameA)(HMODULE, LPSTR, DWORD);
 static PFN_GetModuleFileNameW g_orig_gmfnw = NULL;
 static PFN_GetModuleFileNameA g_orig_gmfna = NULL;
+// 直接指向 **kernelbase** 里的真实现。
+//
+// 为什么不能只用 trampoline：kernel32 的 GetModuleFileNameW/A 是**转发 stub**，
+// 而第 150 轮量到"透传"这条路会崩 —— 命中时 rip 落在 guadbg.exe 自己的范围
+// （guadbg.exe+0x15bc040），返回地址正是 .text 里那个调用者（Sky.exe+0x1db7665）。
+// 也就是说：一旦某个非保护层调用者走到"调用原函数"，就会掉进一个有问题的 trampoline。
+// kernelbase 的实现我们**没有**改过，所以直接从它那里取地址最稳。
+static PFN_GetModuleFileNameW g_real_gmfnw = NULL;
+static PFN_GetModuleFileNameA g_real_gmfna = NULL;
 static int g_gmfn_logged = 0;
 
 // 目标映像里**可执行的段**（本目标就是两个 .sky）。用来判断"这次调用是谁发的"。
@@ -4364,6 +4373,7 @@ static DWORD WINAPI hk_getmodulefilenamew(HMODULE hModule, LPWSTR lpFilename, DW
         memcpy(lpFilename, g_target_path, (n + 1) * sizeof(WCHAR));
         return (DWORD)n;
     }
+    if (g_real_gmfnw) return g_real_gmfnw(hModule, lpFilename, nSize);
     if (g_orig_gmfnw) return g_orig_gmfnw(hModule, lpFilename, nSize);
     SetLastError(ERROR_INVALID_HANDLE);
     return 0;
@@ -4385,6 +4395,7 @@ static DWORD WINAPI hk_getmodulefilenamea(HMODULE hModule, LPSTR lpFilename, DWO
             return (DWORD)len;
         }
     }
+    if (g_real_gmfna) return g_real_gmfna(hModule, lpFilename, nSize);
     if (g_orig_gmfna) return g_orig_gmfna(hModule, lpFilename, nSize);
     SetLastError(ERROR_INVALID_HANDLE);
     return 0;
@@ -4669,6 +4680,16 @@ int main(int argc, char** argv) {
             (PVOID*)&g_orig_gmfnw);
         hook_pair_k32(hKernel32, "GetModuleFileNameA", hk_getmodulefilenamea,
             (PVOID*)&g_orig_gmfna);
+        // 透传时用 kernelbase 里的真实现（那边我们一个字都没改）
+        HMODULE hKb = GetModuleHandleW(L"kernelbase.dll");
+        if (hKb) {
+            g_real_gmfnw = (PFN_GetModuleFileNameW)mem_find_export(hKb, "GetModuleFileNameW");
+            g_real_gmfna = (PFN_GetModuleFileNameA)mem_find_export(hKb, "GetModuleFileNameA");
+            logf("[*] 透传目标（kernelbase 真实现）: W=%p A=%p\n",
+                 (void*)g_real_gmfnw, (void*)g_real_gmfna);
+        } else {
+            logf("[!] kernelbase 未加载，透传将退回 trampoline\n");
+        }
     } else {
         logf("[!] GetModuleFileNameW/A 钩子默认关闭（GUADBG_GMNF=1 打开；打开后曾导致 0xC0000005）\n");
     }
