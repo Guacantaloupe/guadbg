@@ -951,6 +951,32 @@ def main():
                                if regs.get(k) is not None]
                         if _rs:
                             print("          全寄存器: %s" % " ".join(_rs))
+                        # 第 218 轮：**把"这次命中的是哪个线程"打出来**（get_state.paused_tid ✓）。
+                        # 为什么需要：第 216/217 轮我一度用"线程创建时间"去猜"哪个线程在跑游戏" ✗ ——
+                        # 而引擎其实直接知道答案（它暂停的就是那个线程 ✓）。
+                        # 有了这个 tid，就能和"主窗口的拥有者线程""各线程的内核等待原因"在**同一次运行内**对齐 ✓
+                        _st = call("get_state", {}).get("result", {}) or {}
+                        if _st.get("paused_tid"):
+                            print("          命中线程 tid=%s" % _st.get("paused_tid"))
+                        # 第 219 轮：**把栈顶的返回地址读出来** —— 这是"谁调用了这个函数"的最直接证据。
+                        # 为什么重要：在**别的模块**（如 ntdll 的系统调用桩）下断点时，
+                        # `[rsp]` 就是调用方的返回地址 ⇒ 能直接定位到**游戏自己的代码** ✓
+                        # （比"寄存器里的句柄"可靠得多：桩入口处的寄存器还没被动过 ✓）
+                        _rsp = regs.get("rsp")
+                        if _rsp:
+                            try:
+                                _ra = int(str(_rsp), 0) if not str(_rsp).startswith("0x") else int(str(_rsp), 16)
+                            except ValueError:
+                                _ra = None
+                            if _ra:
+                                _m = call("read_mem", {"addr": _ra, "len": 0x18}).get("result", {})
+                                _hx = (_m.get("hex") or "")
+                                if len(_hx) >= 16:
+                                    _vals = [int.from_bytes(bytes.fromhex(_hx[i:i + 16]), "little")
+                                             for i in range(0, min(len(_hx), 48), 16)]
+                                    print("          [rsp]=%#x  返回地址=%#x  栈上还有: %s"
+                                          % (_ra, _vals[0],
+                                             " ".join("%#x" % v for v in _vals[1:])))
                         # --on-bp-cmd <命令行>：**每次软件断点命中时**在暂停期间执行一条外部命令。
                         #
                         # 为什么需要它（第 209 轮）：
