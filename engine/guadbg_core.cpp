@@ -3014,6 +3014,18 @@ static LONG NTAPI gua_veh(PEXCEPTION_POINTERS ep) {
             (unsigned long long)ep->ContextRecord->Rip,
             (unsigned long long)ep->ExceptionRecord->ExceptionInformation[0],
             (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
+        // 第 197 轮：**在这里**（VEH 里、异常现场）把关键寄存器也写进日志。
+        //
+        // 为什么：第 187 轮发现"探针报的寄存器"和内核给的 info2 对不上
+        // （info2=8 ⇒ rax 应为 0，但转储说 rax=4）。到底是**上下文取错**还是**转储路径**有问题，
+        // 静态看代码看不出来 —— 那就让引擎在异常现场直接把 ep->ContextRecord 里的值写下来，
+        // 回头和探针报的对比：一致就说明转储没错，不一致就说明取上下文的路径有问题。
+        // 这条日志是**内核现场**的值，和 info1/info2 同源，所以可信。
+        logf("[!]   现场寄存器: rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rsp=%llx rbp=%llx\n",
+            (unsigned long long)ep->ContextRecord->Rax, (unsigned long long)ep->ContextRecord->Rbx,
+            (unsigned long long)ep->ContextRecord->Rcx, (unsigned long long)ep->ContextRecord->Rdx,
+            (unsigned long long)ep->ContextRecord->Rsi, (unsigned long long)ep->ContextRecord->Rdi,
+            (unsigned long long)ep->ContextRecord->Rsp, (unsigned long long)ep->ContextRecord->Rbp);
         char reason[192];
         sprintf_s(reason, "异常 0x%08X @ 0x%llx", code,
             (unsigned long long)ep->ExceptionRecord->ExceptionAddress);
@@ -3521,6 +3533,33 @@ static jval* cmd_dispatch(const char* cmd, jval* args, jval* result) {
     else if (!strcmp(cmd, "get_ctx")) {
         u = jv_numval(args, "tid", 0);
         if (!u) { jv_put(result, "error", jv_str("缺少 tid")); return result; }
+        // 第 197 轮修：**暂停线程的上下文必须用 g_pctx**（VEH 里内核给的 ContextRecord）。
+        //
+        // 原来这里一律 `OpenThread + GetThreadContext` —— 而暂停期间目标线程**正停在我们的 VEH 里**
+        // （它没有被挂起，只是在等 g_go），对一个这样的线程取上下文拿到的是**过期/无关**的值。
+        // 实测对比（同一个空指针崩）：
+        //     引擎在异常现场记的: rax=0 rbx=1e3fdedf048 rcx=0 rdx=1420c5371 rsi=1e3fdede520 rsp=99305fe860
+        //     探针从 get_ctx 拿到的: rax=4 rbx=d4 rcx=d4 rdx=0 rsi=ffffffff rsp=99305fcd48
+        // 两边完全对不上 —— 第 182~196 轮里那些"寄存器读数可疑"的根源就在这里。
+        if (g_pctx && (DWORD)u == g_paused_tid) {
+            jsb b; jsb_init(&b);
+            ctx_to_json(&b, g_pctx);
+            jv_put(result, "regs", json_parse(b.p));
+            free(b.p);
+            jv_put(result, "source", jv_str("veh"));
+            return result;
+        }
+        // 别的线程：优先用**挂起时保存的快照**（同样比对一个没挂起的线程取上下文可靠）
+        for (int i = 0; i < g_sus_n; i++) {
+            if (g_sus_tid[i] == (DWORD)u) {
+                jsb b2; jsb_init(&b2);
+                ctx_to_json(&b2, &g_sus_ctx[i]);
+                jv_put(result, "regs", json_parse(b2.p));
+                free(b2.p);
+                jv_put(result, "source", jv_str("suspend"));
+                return result;
+            }
+        }
         HANDLE h = OpenThread(THREAD_GET_CONTEXT, FALSE, (DWORD)u);
         if (!h) { jv_put(result, "error", jv_str("打开线程失败")); return result; }
         CONTEXT c2;
@@ -3532,6 +3571,7 @@ static jval* cmd_dispatch(const char* cmd, jval* args, jval* result) {
         ctx_to_json(&b, &c2);
         jv_put(result, "regs", json_parse(b.p));
         free(b.p);
+        jv_put(result, "source", jv_str("live"));
     }
     else if (!strcmp(cmd, "set_thread_reg")) {
         u = jv_numval(args, "tid", 0);
