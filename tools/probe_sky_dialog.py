@@ -884,6 +884,15 @@ def main():
                                               "where": w} for s, q, w in ch]
                 print("    %5.1f 秒: **命中断点** rip=%#x (%s) reason=%s"
                       % (time.time() - t0, rip, where(rip, mods) or "不在已知模块里", reason))
+                # 第 182 轮：**所有停止点**都打一遍通用寄存器。
+                # 为什么：出问题的指针往往不在 rcx/rdx/r8/r9 里，而在 rax/rbx/rsi/rdi
+                # （例如 `call qword ptr [rax+8]` 这种间接调用）。只打前四个会漏掉真凶。
+                _r = ["%s=%s" % (k, regs.get(k))
+                      for k in ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                                "r8", "r9", "r10", "r11")
+                      if regs.get(k) is not None]
+                if _r:
+                    print("          全寄存器: %s" % " ".join(_r))
                 for i in ins:
                     print("          %s" % i.get("text", i))
 
@@ -900,6 +909,14 @@ def main():
                 for rn in ("rcx", "rdx", "r8", "r9"):
                     if regs.get(rn) is not None:
                         args[rn] = as_int(regs[rn])
+                # 第 182 轮：把所有通用寄存器打出来。
+                # 为什么：崩溃时出问题的指针往往**不在** rcx/rdx/r8/r9 里，而在 rax/rbx/rsi/rdi 里
+                # （例如 `call qword ptr [rax+8]` 这种间接调用）。只打前四个会漏掉真凶。
+                _r = ["%s=%s" % (k, regs.get(k))
+                      for k in ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11")
+                      if regs.get(k) is not None]
+                if _r:
+                    print("          全寄存器: %s" % " ".join(_r))
                 if args:
                     print("          参数："
                           + "  ".join("%s=%#x" % (k, v) for k, v in args.items()))
