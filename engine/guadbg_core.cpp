@@ -2904,6 +2904,21 @@ static LONG NTAPI gua_veh(PEXCEPTION_POINTERS ep) {
     default: {
         if (code == DBG_PRINTEXCEPTION_C || code == DBG_PRINTEXCEPTION_WIDE_C)
             return EXCEPTION_CONTINUE_SEARCH;
+        // 系统在**派发/展开异常**时的记账码，不是被调试者自己的故障：
+        //   0xC0000026 STATUS_INVALID_DISPOSITION · 0xC0000027 STATUS_UNWIND
+        //   0xC0000028 STATUS_BAD_STACK · 0xC0000029 STATUS_INVALID_UNWIND_TARGET
+        //
+        // 为什么放行而不暂停（这是**实测**出来的，不是推理）：第 131 轮有一个实验只挂了一页
+        // 保护页去抓改写者，而它拿到的 3 次命中里，第 1 次是真正想看的那次保护页命中，
+        // 第 2、3 次**全是同一个 ntdll 地址上反复出现的 0xC0000026**——
+        // 也就是说这类暂停把实验的剩余次数整个吃掉了。
+        // 而"反复出现在同一个系统地址"本身就说明它不是目标自己的故障：目标随后照常运行。
+        if (code == 0xC0000026u || code == 0xC0000027u ||
+            code == 0xC0000028u || code == 0xC0000029u) {
+            logf("[i] VEH 放行系统记账异常 code=0x%08X addr=%llx（不暂停）\n", code,
+                (unsigned long long)ep->ExceptionRecord->ExceptionAddress);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         logf("[!] VEH 捕获异常 code=0x%08X addr=%llx rip=%llx info1=%llx info2=%llx\n", code,
             (unsigned long long)ep->ExceptionRecord->ExceptionAddress,
             (unsigned long long)ep->ContextRecord->Rip,
