@@ -105,6 +105,90 @@ def as_int(v):
     return v if isinstance(v, int) else int(str(v).strip(), 16)
 
 
+def is_return_address(addr, mods):
+    """这个值像不像「某条 call 的下一条指令」？
+
+    为什么要验证：栈上绝大多数值不是返回地址（局部变量、指针、参数都会混进来）。
+    只有"前面几字节里能解出一条 call、而且那条 call 正好**结束**在这个地址"的值，
+    才真的是调用点。做法：读它前面 24 字节，从每个可能的起点(1..15)试着反汇编一条指令。
+    """
+    mo = None
+    for m in mods:
+        b = as_int(m.get("base", 0))
+        sz = as_int(m.get("size", 0))
+        if b and sz and b <= addr < b + sz:
+            mo = m
+            break
+    if mo is None:
+        return False
+    start = addr - 24
+    m = call("read_mem", {"addr": start, "len": 32}).get("result", {})
+    hx = str(m.get("hex", "")).replace(" ", "")
+    if len(hx) < 64:
+        return False
+    raw = bytes.fromhex(hx)
+    try:
+        import capstone
+    except Exception:
+        return False
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    for off in range(1, 16):
+        try:
+            it = next(md.disasm(raw[off:off + 15], start + off))
+        except Exception:
+            continue
+        if it.mnemonic == "call" and it.address + it.size == addr:
+            return True
+    return False
+
+
+def print_stack_chain(regs, mods, nbytes):
+    """从 rsp 往上扫，只打印**验证过**的返回地址 —— 也就是调用链。
+
+    第 165 轮第一次跑：`[rsp]=0`、整个 0x600 窗口里**一个验证过的返回地址都没有**。
+    这有两种可能：① rsp 不是"帧顶"（引擎报的寄存器可能不是我们以为的那个）；
+    ② 栈被保护层打乱过（有些壳会加密栈上的返回地址）。
+    所以这里改成：**从 rsp-0x200 开始**扫 nbytes 字节，并在找不到时打印原始字节 —— 让数据自己说话。
+    """
+    rsp = as_int(regs.get("rsp", 0))
+    if not rsp:
+        print("          （拿不到 rsp，跳过调用链扫描）")
+        return []
+    start = rsp - 0x200
+    print("          —— 调用链：从 %#x（rsp-0x200）往上扫 %#x 字节，只列**验证过的返回地址** ——"
+          % (start, nbytes))
+    chain = []
+    dumped = False
+    step = 0x100
+    off = 0
+    while off < nbytes:
+        n = min(step, nbytes - off)
+        m = call("read_mem", {"addr": start + off, "len": n}).get("result", {})
+        hx = str(m.get("hex", "")).replace(" ", "")
+        if len(hx) < 32:
+            off += n
+            continue
+        raw = bytes.fromhex(hx)
+        if not dumped:
+            dumped = True
+            print("            原始字节（开头 0x80）: %s" % raw[:0x80].hex())
+        for i in range(0, len(raw) - 7, 8):
+            q = int.from_bytes(raw[i:i + 8], "little")
+            if not q:
+                continue
+            w = where(q, mods)
+            if not w:
+                continue
+            if is_return_address(q, mods):
+                chain.append((start + off + i, q, w))
+        off += n
+    for slot, q, w in chain:
+        print("            [+%#05x 相对 rsp] %#x  %s   ← **返回地址**" % (slot - rsp, q, w))
+    if not chain:
+        print("            （这一窗口里没有验证过的返回地址）")
+    return chain
+
+
 def where(addr, mods):
     """把地址标成「模块+偏移」。"""
     for mo in mods:
@@ -239,6 +323,11 @@ def main():
     # 以及两个候选锁对象。若索引是无效值（0 或 0xFFFFFFFF）或锁对象全零，
     # 就能直接说"该初始化它的那一步没跑"，而不是继续猜。
     read_at = []
+    stack_chain = 0
+    if "--stack-chain" in sys.argv:
+        i = sys.argv.index("--stack-chain")
+        stack_chain = int(sys.argv[i + 1], 0) if (i + 1 < len(sys.argv)
+                                                  and not sys.argv[i + 1].startswith("--")) else 0x400
     for i, a0 in enumerate(sys.argv):
         if a0 == "--read-at" and i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--"):
             spec = sys.argv[i + 1]
@@ -441,12 +530,23 @@ def main():
             spec = sys.argv[i + 1]
             if spec.startswith("--"):
                 continue
-            a = int(spec, 0)
+            # 支持 "地址@条件"：第 165 轮用它只在**传 NULL** 的那次调用上停下 ——
+            # 否则 EnterCriticalSection 太热，会在崩溃之前就被打爆。
+            # （先拆 '@' 再 int()；第 165 轮我把顺序写反了，直接 ValueError 崩在启动阶段。）
+            cond = None
+            a_s = spec
+            if "@" in spec:
+                a_s, _at, cond = spec.partition("@")
+            a = int(a_s, 0)
             if not mods:
                 mods = call("list_modules").get("result", {}).get("modules", []) or []
-            r = call("set_bp", {"addr": a}).get("result", {})
+            args_bp = {"addr": a}
+            if cond:
+                args_bp["cond"] = cond
+            r = call("set_bp", args_bp).get("result", {})
             if r.get("error") is None and r.get("id") is not None:
-                print("    软件断点 @ %#x -> id=%s" % (a, r.get("id")))
+                print("    软件断点 @ %#x%s -> id=%s"
+                      % (a, ("  条件: %s" % cond) if cond else "", r.get("id")))
                 bpname[a] = "sw@%#x" % a
                 bpid[a] = r.get("id")
             else:
@@ -577,6 +677,12 @@ def main():
                             print("               ⇒ **全零**")
                         result.setdefault("read_at", []).append(
                             {"addr": "%#x" % a_r, "len": l_r, "hex": hx})
+                # --stack-chain：把**验证过的返回地址**列出来（问"谁调用到这里"）
+                if stack_chain and not result.get("chain_done") and mods:
+                    result["chain_done"] = True
+                    ch = print_stack_chain(regs, mods, stack_chain)
+                    result["stack_chain"] = [{"slot": "%#x" % s, "ret": "%#x" % q,
+                                              "where": w} for s, q, w in ch]
                 print("    %5.1f 秒: **命中断点** rip=%#x (%s) reason=%s"
                       % (time.time() - t0, rip, where(rip, mods) or "不在已知模块里", reason))
                 for i in ins:
