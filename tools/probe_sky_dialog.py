@@ -676,6 +676,30 @@ def main():
                             ("0x1424e97d0", "0100008000000000")):
                 sys.argv += ["--write-at", "%s:%s" % (a_s, hx)]
             print("  [GUADBG_SKY_INIT=1] 自动补三处初值（入口暂停时写；锁按正规 CRITICAL_SECTION 初始化）")
+        # --write-at-file <路径>：从**文件**读写入清单（每行 `0x地址:十六进制`，`#` 开头是注释）。
+        #
+        # 为什么需要它（第 201 轮的教训，本会话第三次被同类问题咬）：
+        #   批量写入经**命令行**传参时会被 shell 搅坏（编码/引号），探针拿到 `'������1'`
+        #   直接在启动阶段 `ValueError` 退出 —— 于是整轮**没有任何输出**，
+        #   而"没有输出"和"这次没崩"看起来一模一样，**极容易被误读成好消息**。
+        #   走文件就绕开所有 shell 引号/编码问题。
+        if "--write-at-file" in sys.argv:
+            _i = sys.argv.index("--write-at-file")
+            if _i + 1 < len(sys.argv):
+                _path = sys.argv[_i + 1]
+                try:
+                    with open(_path, "r", encoding="utf-8") as _fh:
+                        _n = 0
+                        for _line in _fh:
+                            _line = _line.strip()
+                            if not _line or _line.startswith("#"):
+                                continue
+                            sys.argv += ["--write-at", _line]
+                            _n += 1
+                    print("  从文件读入 %d 条写入清单: %s" % (_n, _path))
+                except OSError as _ex:
+                    print("  **读写入清单失败: %s**" % _ex)
+                    return 1
         for i, a0 in enumerate(sys.argv):
             if a0 != "--write-at" or i + 1 >= len(sys.argv):
                 continue
@@ -683,7 +707,18 @@ def main():
             if spec.startswith("--"):
                 continue
             a_s, _c, hx = spec.partition(":")
-            r = call("write_mem", {"addr": int(a_s, 0), "hex": hx}).get("result", {})
+            # 第 201/202 轮：**参数坏了必须大声失败**，不能悄悄退出。
+            # 之前的教训是：argv 被 shell 搅坏 ⇒ `int(a_s, 0)` 抛 ValueError ⇒
+            # 探针在启动阶段就死了，整轮零输出 —— 看起来像"这次没崩" ✗
+            try:
+                _addr = int(a_s, 0)
+                if not hx or len(hx) % 2 or any(c not in "0123456789abcdefABCDEF" for c in hx):
+                    raise ValueError("hex 不合法: %r" % hx)
+            except ValueError as _ex:
+                print("  **写入清单条目无法解析: %r（%s）—— 本轮中止，"
+                      "不要把它当成「没有崩溃」**" % (spec, _ex))
+                return 2
+            r = call("write_mem", {"addr": _addr, "hex": hx}).get("result", {})
             ok = r.get("ok")
             print("    **写入** %s ← %s  → %s"
                   % (a_s, hx, ("ok，写了 %s 字节" % r.get("written")) if ok
@@ -798,6 +833,17 @@ def main():
                         print("    %5.2f 秒: %-26s （第 %d 次命中）rcx=%s rdx=%s"
                               % (time.time() - t0, bpname[rip], nhit,
                                  regs.get("rcx"), regs.get("rdx")))
+                        # 第 202 轮：**软件断点命中时也把所有通用寄存器打出来**。
+                        # 为什么：想在"某条指令执行的那一刻"看 rax/r14 这类值
+                        # （例如 `mov r15,[rax+r14*8]` 的 rax/r14），
+                        # 而崩溃时的寄存器**已经被后面的指令改过了** —— 只有停在那条指令上才看得到真值。
+                        # 探针从第 197 轮起取的是 VEH 的 ContextRecord，所以这些读数是可信的。
+                        _rs = ["%s=%s" % (k, regs.get(k))
+                               for k in ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                                         "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15")
+                               if regs.get(k) is not None]
+                        if _rs:
+                            print("          全寄存器: %s" % " ".join(_rs))
                         if regs.get("rsp") is not None and mods:
                             try:
                                 rspv = as_int(regs["rsp"])
