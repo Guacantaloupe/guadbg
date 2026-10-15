@@ -134,13 +134,19 @@ def main():
             check("list_threads 返回线程表",
                   len(r.get("threads", [])) > 0, "%d 个" % len(r.get("threads", [])))
 
-            r = call("read_mem", {"addr": KNOWN_ENTRY, "size": 32}).get("result", {})
-            check("read_mem 读得到入口字节", "hex" in r or "bytes" in r, list(r.keys())[:6])
+            # 键名是 len 不是 size（见 docs/COMMAND_SCHEMA.md）。传错键**不会报错**——
+            # 引擎回退默认值 128，于是"读了 32 字节"这句话是假的。所以长度也要断言。
+            r = call("read_mem", {"addr": KNOWN_ENTRY, "len": 32}).get("result", {})
+            got_hex = str(r.get("hex", "")).replace(" ", "")
+            check("read_mem 读得到入口字节", bool(got_hex), list(r.keys())[:6])
+            check("read_mem 真的读了 32 字节（不是回退的默认 128）",
+                  r.get("len") == 32 and len(got_hex) == 64,
+                  "len=%s hex_chars=%d" % (r.get("len"), len(got_hex)))
 
             r = call("disasm", {"addr": KNOWN_ENTRY, "count": 8}).get("result", {})
             check("disasm 反汇编得了入口", "insns" in r or "lines" in r, list(r.keys())[:6])
 
-            r = call("exports", {}).get("result", {})
+            r = call("exports", {"module": "Sky.exe"}).get("result", {})
             check("exports 返回结构（Sky.exe 可能为空，这是正常的）",
                   "exports" in r, "%d 项" % len(r.get("exports", [])))
 
@@ -157,9 +163,12 @@ def main():
             r = call("set_mem_bp", {"addr": KNOWN_BASE + 0x1DCC000, "size": 0x1000}).get("result", {})
             has_err = "error" in r
             check("set_mem_bp 被接受（返回结果而非错误）", not has_err, r.get("error", "")[:70])
+            # 结果键是 breakpoints 不是 bps；而 `len(...) >= 0` 恒真——
+            # 那是"因为没在检查所以通过"。既然上面刚设了一个，就必须能列出至少一个。
             r2 = call("list_bps").get("result", {})
-            check("设置后 list_bps 能列出它", len(r2.get("bps", [])) >= 0,
-                  "%d 个断点" % len(r2.get("bps", [])))
+            bps = r2.get("breakpoints", [])
+            check("设置后 list_bps 能列出至少那一个断点", len(bps) >= 1,
+                  "%d 个断点" % len(bps))
 
     finally:
         try:
