@@ -233,6 +233,20 @@ def main():
     del_after = 0
     if "--del-after" in sys.argv:
         del_after = int(sys.argv[sys.argv.index("--del-after") + 1])
+    # --read-at <addr>:<len>（可重复）：**每次暂停时**把这几处内存读出来。
+    #
+    # 用途：崩溃暂停时顺手看几个全局 —— 例如 CRT 的 per-thread 数据 TLS 索引、
+    # 以及两个候选锁对象。若索引是无效值（0 或 0xFFFFFFFF）或锁对象全零，
+    # 就能直接说"该初始化它的那一步没跑"，而不是继续猜。
+    read_at = []
+    for i, a0 in enumerate(sys.argv):
+        if a0 == "--read-at" and i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--"):
+            spec = sys.argv[i + 1]
+            if ":" in spec:
+                a_s, l_s = spec.split(":", 1)
+                read_at.append((int(a_s, 0), int(l_s, 0)))
+            else:
+                read_at.append((int(spec, 0), 8))
 
     switches = {k: v for k, v in os.environ.items()
                 if k.startswith("GUADBG_SKIP_")}
@@ -489,6 +503,26 @@ def main():
                     call("resume")
                     continue
                 ins = call("disasm", {"addr": rip, "count": 3}).get("result", {}).get("lines", [])
+                # --read-at：暂停时把这几个地址读出来（同一处只打一次，避免刷屏）
+                if read_at and not result.get("read_at_done"):
+                    result["read_at_done"] = True
+                    print("          —— 顺带读几个全局 ——")
+                    for a_r, l_r in read_at:
+                        m = call("read_mem", {"addr": a_r, "len": l_r}).get("result", {})
+                        hx = str(m.get("hex", "")).replace(" ", "")
+                        if not hx:
+                            print("            %#x (%d 字节): **读不到** %s"
+                                  % (a_r, l_r, m.get("error", "")))
+                            continue
+                        raw = bytes.fromhex(hx)
+                        qs = [int.from_bytes(raw[i:i + 8].ljust(8, b"\0"), "little")
+                              for i in range(0, len(raw), 8)]
+                        print("            %#x (%d 字节): %s" % (a_r, l_r, hx))
+                        print("               按 qword 看: %s" % ["%#x" % q for q in qs])
+                        if all(b == 0 for b in raw):
+                            print("               ⇒ **全零**")
+                        result.setdefault("read_at", []).append(
+                            {"addr": "%#x" % a_r, "len": l_r, "hex": hx})
                 print("    %5.1f 秒: **命中断点** rip=%#x (%s) reason=%s"
                       % (time.time() - t0, rip, where(rip, mods) or "不在已知模块里", reason))
                 for i in ins:
