@@ -700,6 +700,113 @@ def main():
                 except OSError as _ex:
                     print("  **读写入清单失败: %s**" % _ex)
                     return 1
+        # --on-bp-cmd <命令行...>：每次软件断点命中时执行（在暂停期间）
+        ON_BP_CMD = None
+        if "--on-bp-cmd" in sys.argv:
+            _i = sys.argv.index("--on-bp-cmd")
+            if _i + 1 < len(sys.argv):
+                ON_BP_CMD = sys.argv[_i + 1:]
+                print("  [--on-bp-cmd] 断点命中时将执行: %s" % " ".join(ON_BP_CMD))
+        # --tls-mark <索引全局地址>:<偏移>:<值hex>
+        #
+        # 为什么需要它（第 208/209 轮，这条很重要）：
+        #   注册初始化被**两道检查**挡住：
+        #       0x140886fc6  mov eax, [0x1425838e0]        ; 全局（"最新版本号"）
+        #       0x140886fcc  mov ecx, [0x14296dac8]        ; **TLS 索引**
+        #       0x140886fdb  mov rcx, [gs:[0x58]+rcx*8]    ; 本线程的 TLS 数据块
+        #       0x140886fdf  cmp eax, [rcx+4]              ; 全局 vs 本线程已见版本
+        #       0x140886fe5  jg  0x140887000               ; 只有"全局 > 本线程"才进去
+        #   ⇒ 本线程那个 dword 必须是**负数**（≤ -2）才行；我们宿主里它是 0（从没初始化过）✗
+        #
+        # 为什么必须由**探针**来做（第 208 轮的教训）：
+        #   我试过"后台跑目标 + 外部工具抢时间写" —— 目标的存活窗口只有几秒，
+        #   而两次工具调用之间隔了几十秒 ⇒ 外部工具永远只看到"找不到进程" ✗。
+        #   **凡是要与目标运行状态对齐的写入，都必须在探针的暂停点执行** ✓
+        #   这里就在"入口暂停"这个时机做（与 --write-at 同一时刻）。
+        class _TE32(ctypes.Structure):
+            _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
+                        ("th32ThreadID", ctypes.c_ulong), ("th32OwnerProcessID", ctypes.c_ulong),
+                        ("tpBasePri", ctypes.c_long), ("tpDeltaPri", ctypes.c_long),
+                        ("dwFlags", ctypes.c_ulong)]
+
+        class _CLIENT_ID(ctypes.Structure):
+            _fields_ = [("UniqueProcess", ctypes.c_void_p), ("UniqueThread", ctypes.c_void_p)]
+
+        class _TBI(ctypes.Structure):
+            _fields_ = [("ExitStatus", ctypes.c_long), ("TebBaseAddress", ctypes.c_void_p),
+                        ("ClientId", _CLIENT_ID), ("AffinityMask", ctypes.c_void_p),
+                        ("Priority", ctypes.c_long), ("BasePriority", ctypes.c_long)]
+
+        for i, a0 in enumerate(sys.argv):
+            if a0 != "--tls-mark" or i + 1 >= len(sys.argv):
+                continue
+            spec = sys.argv[i + 1]
+            if spec.startswith("--"):
+                continue
+            try:
+                g_s, o_s, v_s = spec.split(":")
+                gaddr, toff, tval = int(g_s, 0), int(o_s, 0), int(v_s, 16)
+            except ValueError as _ex:
+                print("  **--tls-mark 参数无法解析: %r（%s）—— 本轮中止**" % (spec, _ex))
+                return 2
+            m = call("read_mem", {"addr": gaddr, "len": 4}).get("result", {})
+            hx = (m.get("hex") or "")[:8]
+            if len(hx) != 8:
+                print("  **读不到索引全局 %#x（%s）**" % (gaddr, m.get("error")))
+                continue
+            index = int.from_bytes(bytes.fromhex(hx), "little")
+            print("  [--tls-mark] 索引全局 %#x = %d（%#x）" % (gaddr, index, index))
+            # **注意（第 209 轮自己的一个 bug）**：`0` 是**合法的** TLS 槽号
+            # （TlsAlloc 完全可能返回 0），只有 `TLS_OUT_OF_INDEXES = 0xFFFFFFFF` 才表示"没分配"。
+            # 我第一版把 0 也当成"没分配"跳过了 ✗ —— 于是什么都没写、也看不出原因。
+            if index == 0xFFFFFFFF:
+                print("     索引是 0xFFFFFFFF ⇒ 该 TLS 还没分配，跳过")
+                continue
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            ntdll = ctypes.WinDLL("ntdll")
+            snap = k32.CreateToolhelp32Snapshot(0x4, 0)
+            te = _TE32()
+            te.dwSize = ctypes.sizeof(te)
+            ok = k32.Thread32First(snap, ctypes.byref(te))
+            n_th = n_done = 0
+            while ok:
+                if te.th32OwnerProcessID == eng.pid:
+                    n_th += 1
+                    ht = k32.OpenThread(0x40, False, te.th32ThreadID)
+                    if ht:
+                        tbi = _TBI()
+                        if ntdll.NtQueryInformationThread(ctypes.c_void_p(ht), 0,
+                                                          ctypes.byref(tbi),
+                                                          ctypes.sizeof(tbi), None) == 0 \
+                                and tbi.TebBaseAddress:
+                            sv = call("read_mem", {"addr": tbi.TebBaseAddress + 0x1480 + index * 8,
+                                                   "len": 8}).get("result", {})
+                            shx = (sv.get("hex") or "")[:16]
+                            block = int.from_bytes(bytes.fromhex(shx), "little") if len(shx) == 16 else 0
+                            if block:
+                                b4 = call("read_mem", {"addr": block + toff, "len": 4}).get("result", {})
+                                bhx = (b4.get("hex") or "")[:8]
+                                bval = int.from_bytes(bytes.fromhex(bhx), "little") if len(bhx) == 8 else None
+                                line = "     线程 %d: 块=%#x +%#x 前=%s" % (
+                                    te.th32ThreadID, block, toff,
+                                    ("%#x" % bval) if bval is not None else "（读不到）")
+                                if bval is not None and bval != (tval & 0xFFFFFFFF):
+                                    wr = call("write_mem", {"addr": block + toff,
+                                                            "hex": "%08x" % (tval & 0xFFFFFFFF)})
+                                    wok = wr.get("result", {}).get("ok")
+                                    a4 = call("read_mem", {"addr": block + toff, "len": 4}).get("result", {})
+                                    ahx = (a4.get("hex") or "")[:8]
+                                    aval = int.from_bytes(bytes.fromhex(ahx), "little") if len(ahx) == 8 else None
+                                    line += "  →  后=%s%s" % (
+                                        ("%#x" % aval) if aval is not None else "?",
+                                        "" if wok else "  **写入失败**")
+                                    if wok:
+                                        n_done += 1
+                                print(line)
+                        k32.CloseHandle(ht)
+                ok = k32.Thread32Next(snap, ctypes.byref(te))
+            k32.CloseHandle(snap)
+            print("     线程 %d 个，改动了 %d 个（写成 %#x）" % (n_th, n_done, tval & 0xFFFFFFFF))
         for i, a0 in enumerate(sys.argv):
             if a0 != "--write-at" or i + 1 >= len(sys.argv):
                 continue
@@ -844,6 +951,23 @@ def main():
                                if regs.get(k) is not None]
                         if _rs:
                             print("          全寄存器: %s" % " ".join(_rs))
+                        # --on-bp-cmd <命令行>：**每次软件断点命中时**在暂停期间执行一条外部命令。
+                        #
+                        # 为什么需要它（第 209 轮）：
+                        #   有些"修复"必须在**目标已经跑起来之后**才能做 —— 例如那个 TLS 索引全局
+                        #   （0x14296dac8）在**入口暂停时还是 0**（槽也是空的），要等 CRT 初始化做完才有值 ✓。
+                        #   而外部工具**抢时间**是行不通的：目标存活只有几秒，两次工具调用之间隔几十秒 ✗
+                        #   ⇒ 唯一可靠的办法是：**探针停住目标 → 调外部命令 → 再放行** ✓
+                        #   （目标被暂停时，外部工具可以慢慢地读 TEB、写内存 ✓）
+                        if ON_BP_CMD:
+                            try:
+                                _cp = subprocess.run(ON_BP_CMD, shell=False, capture_output=True,
+                                                     timeout=30)
+                                _txt = (_cp.stdout or b"").decode("utf-8", "replace")
+                                for _ln in _txt.strip().splitlines()[:6]:
+                                    print("          [on-bp-cmd] %s" % _ln.strip())
+                            except Exception as _ex:
+                                print("          [on-bp-cmd] 失败: %s" % _ex)
                         if regs.get("rsp") is not None and mods:
                             try:
                                 rspv = as_int(regs["rsp"])
