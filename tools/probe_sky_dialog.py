@@ -132,7 +132,9 @@ def is_return_address(addr, mods):
     except Exception:
         return False
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-    for off in range(1, 16):
+    # 起点要一直试到 24：一条 `call rel32` 是 **5 字节**，若返回地址在 addr、call 就在 addr-5，
+    # 对应 start=addr-24 时的 off=19 —— 第 166 轮我只试到 15，于是**真返回地址全被判成"不是"**。
+    for off in range(1, 25):
         try:
             it = next(md.disasm(raw[off:off + 15], start + off))
         except Exception:
@@ -324,6 +326,8 @@ def main():
     # 就能直接说"该初始化它的那一步没跑"，而不是继续猜。
     read_at = []
     stack_chain = 0
+    log_bps = set()
+    log_since = 0
     if "--stack-chain" in sys.argv:
         i = sys.argv.index("--stack-chain")
         stack_chain = int(sys.argv[i + 1], 0) if (i + 1 < len(sys.argv)
@@ -553,6 +557,36 @@ def main():
                 print("    软件断点 @ %#x **失败: %s**" % (a, r.get("error")))
                 problems.append("set_bp 失败 @ %#x: %s" % (a, r.get("error")))
 
+        # --sw-bp-log <地址[@条件]>（可重复）：**日志型**断点（set_bp 的 log 模式）。
+        #
+        # 为什么需要：第 165 轮证明，在热函数（EnterCriticalSection 的 thunk）上挂**会停下**的
+        # 条件断点，会把引擎自己打死（code=0x80000004=STATUS_SINGLE_STEP）。
+        # 日志型不停下、只记录，正是为这种"必须观测但不能打断"的场合准备的。
+        for i, a0 in enumerate(sys.argv):
+            if a0 != "--sw-bp-log" or i + 1 >= len(sys.argv):
+                continue
+            spec = sys.argv[i + 1]
+            if spec.startswith("--"):
+                continue
+            cond = None
+            a_s = spec
+            if "@" in spec:
+                a_s, _at, cond = spec.partition("@")
+            a = int(a_s, 0)
+            if not mods:
+                mods = call("list_modules").get("result", {}).get("modules", []) or []
+            args_bp = {"addr": a, "log": 1}
+            if cond:
+                args_bp["cond"] = cond
+            r = call("set_bp", args_bp).get("result", {})
+            if r.get("error") is None and r.get("id") is not None:
+                print("    **日志型**断点 @ %#x%s -> id=%s（不停下，只记录）"
+                      % (a, ("  条件: %s" % cond) if cond else "", r.get("id")))
+                log_bps.add(a)
+            else:
+                print("    日志型断点 @ %#x **失败: %s**" % (a, r.get("error")))
+                problems.append("set_bp(log) 失败 @ %#x: %s" % (a, r.get("error")))
+
         # --manual-pause：**对照实验** —— 不用任何断点，只像陷阱那样把目标停一小会儿。
         #
         # 目的：把"挂住那次 CreateFileW 之后对话框就不出现"的两种解释分开：
@@ -576,12 +610,44 @@ def main():
         seen = None
         while time.time() - t0 < secs:
             time.sleep(poll)
+            # 日志型断点：不停下，条目落在引擎的日志里 —— 每轮把新增的取出来打掉
+            if log_bps:
+                lg = call("get_log", {"since": log_since}).get("result", {}) or {}
+                ents = lg.get("entries") or []
+                if ents:
+                    try:
+                        log_since = int(lg.get("next", log_since))
+                    except Exception:
+                        pass
+                    for e in ents[:20]:
+                        print("    [引擎日志] %s" % (e,))
+                    result.setdefault("engine_log", []).extend(ents[:200])
             # 先看是不是命中了我们挂的断点（命中时引擎会停在 paused）
             st2 = call("get_state").get("result", {})
             if st2.get("state") == "paused":
                 rip = st2.get("rip", 0)
                 reason = str(st2.get("reason", ""))[:70]
                 regs = call("get_regs").get("result", {}).get("regs", {}) or {}
+                # **第 166 轮的重要怀疑**：两次不同运行的"栈"字节**逐字节相同** ——
+                # 活着的栈不可能这样。最可能的原因是我读的**不是出错线程的寄存器**
+                # （引擎暂停时会暂停所有线程，get_regs 不带 tid 可能返回别的线程）。
+                # 所以这里把两个 tid 都打出来；若引擎报的 tid 与 get_regs 的不一致，
+                # 就用 get_ctx 取**出错线程**的上下文来做栈分析。
+                tid_state = st2.get("paused_tid")      # 字段名是 paused_tid（我原先写 tid，一直是 None）
+                tid_regs = regs.get("tid")
+                if not result.get("tid_checked"):
+                    result["tid_checked"] = True
+                    print("          [tid 检查] get_state.paused_tid=%r  get_regs.tid=%r"
+                          % (tid_state, tid_regs))
+                if tid_state:
+                    g2 = call("get_ctx", {"tid": as_int(tid_state)}).get("result", {})
+                    r2 = g2.get("regs") or {}
+                    if r2 and as_int(r2.get("rsp", 0)) != as_int(regs.get("rsp", 0)):
+                        print("          [tid 检查] **rsp 不一致**：get_regs→%s；出错线程 %s→%s"
+                              " ⇒ 改用**出错线程**的上下文（这才是栈分析该用的）"
+                              % (regs.get("rsp"), tid_state, r2.get("rsp")))
+                        regs = r2
+                        result["ctx_tid_used"] = tid_state
                 if rip in bpname:
                     # 文件/对照断点：记下路径（若取得出）就继续，不走下面 MessageBox 那套
                     nhit = hitcount.get(rip, 0) + 1
