@@ -813,6 +813,22 @@ def main():
                                                              "count": 6}).get("result", {})
                                         for ln in (dd.get("lines") or []):
                                             print("            %s" % ln.get("text", ln))
+                                # 第 192 轮：**软件断点暂停时也要把 --read-at 打出来**。
+                                # 之前只有部分暂停类型会打，于是"想读运行期槽值"时正好读不到（踩过两次）。
+                                if read_at and ("--read-at-each" in sys.argv
+                                                or not result.get("read_at_sw_done")):
+                                    result["read_at_sw_done"] = True
+                                    print("          —— 顺带读几个全局（软件断点暂停: %s）——" % bpname[rip])
+                                    for a_r, l_r in read_at:
+                                        mm = call("read_mem", {"addr": a_r, "len": l_r}).get("result", {})
+                                        hx = str(mm.get("hex", "")).replace(" ", "")
+                                        qs = []
+                                        if hx:
+                                            by = bytes.fromhex(hx)
+                                            qs = ["%#x" % int.from_bytes(by[k:k + 8].ljust(8, b"\0"), "little")
+                                                  for k in range(0, max(0, min(l_r, len(by)) - 7), 8)]
+                                        print("             %#x (%d 字节): %s%s"
+                                              % (a_r, l_r, hx, ("  ⇒ " + " ".join(qs)) if qs else []))
                             except Exception as ex:
                                 print("          读栈失败: %s" % ex)
                         if nhit <= 60:
