@@ -111,28 +111,26 @@ def main():
             return 1
 
         print()
-        # 第二张网：保护页。**与线程无关**（页表项是进程级的），所以它能区分两种假设：
-        #   Dr 被 resume 覆盖 / 写者在新线程  => 保护页会命中而硬件断点不会
-        #   地址或宽度没覆盖到            => 两张网都不命中
-        guard_ids = []
-        # 注意页基址要按**节区内偏移的页对齐**算：首差在 .sky[0]+0x2f3b，
-        # 所以页是 +0x2000。写 +0x2F000 会落到 .sky[1] 里去 —— 上一版就是这么错的。
-        for label, addr in (("guard .sky[0] 首差页 (+0x2000)", BASE + SKY0 + 0x2000),
-                            ("guard .sky[0] 段首", BASE + SKY0),
-                            ("guard .sky[1] 第一页", BASE + SKY1 + 0x0)):
-            r = call("set_mem_bp", {"addr": addr, "size": 0x1000}).get("result", {})
-            err = r.get("error")
-            ok = (err is None) and r.get("id") is not None
-            print("  %-34s %#x -> %s" % (label, addr, "id=%s" % r.get("id") if ok
-                                         else "**失败: %s**" % err))
-            result["watches"].append({"label": label, "addr": "%#x" % addr,
-                                      "id": r.get("id"), "error": err, "kind": "guard"})
-            if ok:
-                guard_ids.append(r.get("id"))
-            else:
-                problems.append("set_mem_bp 失败 %s: %s" % (label, err))
-        result["guard_ids"] = guard_ids
-        print()
+        # --guard <VA>：只挂给定的一页保护页，跳过硬件断点。
+        # 用途：第 130 轮量到 0x142c0473a 只写 .sky[0]+0x38 两次，**不是**那 871 个字段的
+        # 批量改写者（首个变化字节在 +0x2f3b）。所以要去抓真正做批量的那一个。
+        only_guard = None
+        if "--guard" in sys.argv:
+            only_guard = int(sys.argv[sys.argv.index("--guard") + 1], 0)
+        if only_guard is not None:
+            r = call("set_mem_bp", {"addr": only_guard, "size": 0x1000}).get("result", {})
+            ok = (r.get("error") is None) and r.get("id") is not None
+            print("  只挂一页保护页 %#x -> %s" % (only_guard,
+                                              "id=%s" % r.get("id") if ok
+                                              else "**失败: %s**" % r.get("error")))
+            result["watches"].append({"label": "only-guard", "addr": "%#x" % only_guard,
+                                      "id": r.get("id"), "error": r.get("error"),
+                                      "kind": "guard"})
+            if not ok:
+                problems.append("set_mem_bp 失败: %s" % r.get("error"))
+                return 1
+            result["guard_ids"] = [r.get("id")]
+            print()
 
         for n in range(hits_wanted):
             call("resume")
