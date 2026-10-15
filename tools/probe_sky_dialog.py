@@ -115,6 +115,71 @@ def where(addr, mods):
     return None
 
 
+def read_wstr(addr, maxbytes=0x400):
+    """读一段 UTF-16LE 字符串（到第一个 NUL 为止）。返回 (原文, 字节数, 错误)。"""
+    if not addr:
+        return None, 0, "地址为 0"
+    m = call("read_mem", {"addr": addr, "len": maxbytes}).get("result", {})
+    if m.get("error") is not None:
+        return None, 0, str(m.get("error"))
+    hx = str(m.get("hex", "")).replace(" ", "")
+    got = m.get("len")
+    if not hx:
+        return None, 0, "读回空"
+    raw = bytes.fromhex(hx)
+    end = None
+    for i in range(0, len(raw) - 1, 2):
+        if raw[i] == 0 and raw[i + 1] == 0:
+            end = i
+            break
+    body = raw[:end] if end is not None else raw
+    try:
+        s = body.decode("utf-16-le", errors="replace")
+    except Exception as ex:
+        return None, len(raw), "解码失败 %s" % ex
+    return s, len(body), ("len=%s" % got)
+
+
+def dump_wstrings(center, span=0x4000, minlen=6, chunk=0x800):
+    """把 center 附近 span 字节里的 UTF-16 串都找出来，返回 [(相对 center 的偏移, 原文)]。
+
+    动机：第 145 轮发现那句话是**运行时在堆上拼出来**的。既然是一次拼出来的，
+    附近很可能还有同一批的其它串（它在比较哪个文件、哪一段失败、格式串等）——
+    那是最可能直接告诉"它在查什么"的东西。
+    """
+    start = center - span // 2
+    raw = bytearray()
+    off = 0
+    while off < span:
+        n = min(chunk, span - off)
+        m = call("read_mem", {"addr": start + off, "len": n}).get("result", {})
+        hx = str(m.get("hex", "")).replace(" ", "")
+        if not hx:
+            break
+        raw.extend(bytes.fromhex(hx))
+        off += len(hx) // 2
+        if len(hx) // 2 < n:
+            break
+    out = []
+    i = 0
+    while i + 1 < len(raw):
+        j = i
+        chars = []
+        while j + 1 < len(raw):
+            cp = raw[j] | (raw[j + 1] << 8)
+            if 32 <= cp < 0x7F or cp in (0x09, 0x0A, 0x0D) or 0x4E00 <= cp <= 0x9FFF:
+                chars.append(chr(cp))
+                j += 2
+            else:
+                break
+        if len(chars) >= minlen:
+            out.append((start + i - center, "".join(chars)))
+            i = j
+        else:
+            i += 2
+    return out
+
+
 def main():
     secs = 40.0
     if "--secs" in sys.argv:
@@ -207,6 +272,63 @@ def main():
                       % (time.time() - t0, rip, reason))
                 for i in ins:
                     print("          %s" % i.get("text", i))
+
+                # ---- 取参数：这是本轮的正题 ----
+                #
+                # MessageBoxTimeoutW(HWND, LPCWSTR lpText, LPCWSTR lpCaption, UINT uType,
+                #                    WORD wLanguageId, DWORD dwMilliseconds)
+                # x64 约定：rcx / rdx / r8 / r9 / [rsp+0x28] / [rsp+0x30]
+                # （断点落在函数第一条指令上，所以 [rsp] 是返回地址、[rsp+8..0x20] 是影子空间。）
+                # get_regs 给的是**小写十六进制字符串、不带 0x**，所以要经 as_int。
+                args = {}
+                if "lpText" in result:
+                    args = {}      # 参数只取第一次（后面 18 次是同一个循环，重复打印没意义）
+                for rn in ("rcx", "rdx", "r8", "r9"):
+                    if regs.get(rn) is not None:
+                        args[rn] = as_int(regs[rn])
+                if args:
+                    print("          参数："
+                          + "  ".join("%s=%#x" % (k, v) for k, v in args.items()))
+                for rn, label in (("rdx", "lpText"), ("r8", "lpCaption")):
+                    v = args.get(rn)
+                    if not v:
+                        continue
+                    s, nb, note = read_wstr(v)
+                    if s is None:
+                        print("          %s（%s）@ %#x 读不到：%s" % (label, rn, v, note))
+                    else:
+                        print("          %s（%s）@ %#x = %r  [%d 字节]" % (label, rn, v, s[:120], nb))
+                        result[label] = s
+                        result[label + "_ptr"] = "%#x" % v
+                        if mods:
+                            w = where(v, mods)
+                            result[label + "_where"] = w or "（不在已知模块里 —— 可能是堆）"
+                            print("              落在: %s" % (w or "（不在已知模块里 —— 可能是堆）"))
+                        # --dump-near：把这支串附近的**同一批**串都列出来
+                        if "--dump-near" in sys.argv and rn == "rdx":
+                            near = dump_wstrings(v)
+                            print("              附近 %d 字节里找到 %d 支串："
+                                  % (0x4000, len(near)))
+                            for doff, ds in near[:40]:
+                                mark = "  ← lpText 本身" if doff == 0 else ""
+                                print("                [%+#7x] %r%s" % (doff, ds[:100], mark))
+                            result["near_strings"] = [{"off": doff, "s": ds}
+                                                      for doff, ds in near[:40]]
+                # 第 5、6 个参数在栈上：影子空间之后
+                if regs.get("rsp") is not None and "dwTimeout_ms" not in result:
+                    try:
+                        rspv = as_int(regs["rsp"])
+                        m2 = call("read_mem", {"addr": rspv, "len": 0x40}).get("result", {})
+                        hx2 = str(m2.get("hex", "")).replace(" ", "")
+                        if m2.get("len") == 0x40 and len(hx2) == 0x80:
+                            r2 = bytes.fromhex(hx2)
+                            fifth = int.from_bytes(r2[0x28:0x30], "little")
+                            sixth = int.from_bytes(r2[0x30:0x38], "little")
+                            print("          栈上第 5/6 个参数: wLanguageId=%#x  dwTimeout=%#x (%d ms)"
+                                  % (fifth, sixth, sixth))
+                            result["dwTimeout_ms"] = sixth
+                    except Exception as ex:
+                        print("          读栈参数失败: %s" % ex)
                 rsp = regs.get("rsp")
                 if rsp is not None:
                     try:
