@@ -638,6 +638,29 @@ def main():
                 print("    %.1f 秒: 手动暂停 0.15 秒（无断点，纯对照）%s"
                       % (when, "" if r.get("error") is None
                          else "  **pause 失败: %s**" % r.get("error")))
+        # --write-at <地址>:<十六进制>（可重复）：在**入口暂停时**先写内存，再放行。
+        #
+        # 用途（第 169 轮）：正常加载里 Sky.exe 的 `.data+0x3bd7b0` 是 **1**，我们这边是 **0**；
+        # 而 0 会让 CRT 分配包装走 `mov edi, 8` 那一支 ⇒ `EnterCriticalSection((CS*)8)`
+        # ⇒ `lock btr [rdi+8]` 写 0x10 ⇒ 崩。把这一字节补成 1，就能**因果地**验证
+        # 这个 AV 到底是不是"那一步初始化没跑"造成的。
+        for i, a0 in enumerate(sys.argv):
+            if a0 != "--write-at" or i + 1 >= len(sys.argv):
+                continue
+            spec = sys.argv[i + 1]
+            if spec.startswith("--"):
+                continue
+            a_s, _c, hx = spec.partition(":")
+            r = call("write_mem", {"addr": int(a_s, 0), "hex": hx}).get("result", {})
+            ok = r.get("ok")
+            print("    **写入** %s ← %s  → %s"
+                  % (a_s, hx, ("ok，写了 %s 字节" % r.get("written")) if ok
+                     else "**失败: %s**" % r.get("error")))
+            if not ok:
+                problems.append("write_mem 失败 @ %s: %s" % (a_s, r.get("error")))
+            else:
+                result.setdefault("writes", []).append({"addr": a_s, "hex": hx})
+
         call("resume")
 
         t0 = time.time()
