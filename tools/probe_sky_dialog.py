@@ -328,14 +328,16 @@ def main():
     stack_chain = 0
     log_bps = set()
     log_since = 0
-    threads_at = 0.0
+    threads_at = []
     thread_walk = 0x200
     if "--thread-walk" in sys.argv:
         i = sys.argv.index("--thread-walk")
         thread_walk = int(sys.argv[i + 1], 0) if i + 1 < len(sys.argv) else 0x200
     if "--threads-at" in sys.argv:
         i = sys.argv.index("--threads-at")
-        threads_at = float(sys.argv[i + 1]) if i + 1 < len(sys.argv) else 10.0
+        # 支持**多个时刻**（逗号分隔，如 8,18）：用两次快照区分"短暂竞争"与"一直不放"
+        if i + 1 < len(sys.argv):
+            threads_at = [float(x) for x in sys.argv[i + 1].split(",") if x.strip()]
     if "--stack-chain" in sys.argv:
         i = sys.argv.index("--stack-chain")
         stack_chain = int(sys.argv[i + 1], 0) if (i + 1 < len(sys.argv)
@@ -657,16 +659,23 @@ def main():
         # 会被随后清零 —— 崩溃照旧（info2=0x10）；只有在**入口暂停之后、放行之前**写才有效。
         # 所以这个开关的正确落点就在**这里**。
         #
-        # GUADBG_SKY_INIT=1 时，自动补上这三处（默认不补）：
-        #   .data+0x3bd7b0 ← 01
-        #   .data+0x3bd780 ← 0000000000000000ffffffffffffffff
-        #   .data+0x3bd7d0 ← 0100008000000000
+        # GUADBG_SKY_INIT=1 时，自动补上这几处（默认不补）：
+        #   .data+0x3bd7b0 ← 01                       （锁开关字节）
+        #   .data+0x3bd788 ← 正规 CRITICAL_SECTION     （DebugInfo=0, LockCount=-1, RecursionCount=0, OwningThread=0）
+        #   .data+0x3bd7d0 ← 0100008000000000          （计数器）
+        #
+        # **第 181 轮的重要修正**：原来这里是照抄"正常加载"的字节
+        # （`0000000000000000ffffffffffffffff` 写在 +0x780），但把它当 CRITICAL_SECTION 看时
+        # DebugInfo = 0xffffffffffffffff（-1）—— 一把**畸形的锁**。后果是：目标不崩，
+        # 但**四条线程全部死等在那把锁上**（8 秒与 18 秒两次快照逐帧相同 ⇒ 是真停住，不是竞争）。
+        # 改成**正规初始化**之后，停等消失，目标前进到**游戏自己的代码**里再崩
+        # （Sky.exe+0x13dcd43，`call qword ptr [rax+8]` 把数据指针当函数调）。
         if os.environ.get("GUADBG_SKY_INIT", "0") not in ("", "0"):
             for a_s, hx in (("0x1424e97b0", "01"),
-                            ("0x1424e9780", "0000000000000000ffffffffffffffff"),
+                            ("0x1424e9788", "0000000000000000ffffffff000000000000000000000000"),
                             ("0x1424e97d0", "0100008000000000")):
                 sys.argv += ["--write-at", "%s:%s" % (a_s, hx)]
-            print("  [GUADBG_SKY_INIT=1] 自动补三处初值（入口暂停时写）")
+            print("  [GUADBG_SKY_INIT=1] 自动补三处初值（入口暂停时写；锁按正规 CRITICAL_SECTION 初始化）")
         for i, a0 in enumerate(sys.argv):
             if a0 != "--write-at" or i + 1 >= len(sys.argv):
                 continue
@@ -695,9 +704,10 @@ def main():
             #
             # 用途（第 172 轮）：第 171 轮测出"目标跑约 2.5 秒 CPU 之后转入空闲"。
             # 空闲时它到底停在哪？——直接看各线程 Rip 落在哪个模块/函数，比猜可靠。
-            if threads_at and not result.get("threads_done") and time.time() - t0 >= threads_at:
-                result["threads_done"] = True
-                print("    —— %.1f 秒时的线程状态 ——" % (time.time() - t0))
+            for _ta in [t for t in threads_at if time.time() - t0 >= t
+                        and t not in result.get("threads_done_at", [])]:
+                result.setdefault("threads_done_at", []).append(_ta)
+                print("    —— %.1f 秒时的线程状态（--threads-at %g）——" % (time.time() - t0, _ta))
                 tl = call("list_threads").get("result", {}).get("threads") or []
                 print("      线程数 %d" % len(tl))
                 for t in tl[:12]:
