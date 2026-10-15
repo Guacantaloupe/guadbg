@@ -180,10 +180,53 @@ def dump_wstrings(center, span=0x4000, minlen=6, chunk=0x800):
     return out
 
 
+def read_u64(addr):
+    m = call("read_mem", {"addr": addr, "len": 8}).get("result", {})
+    hx = str(m.get("hex", "")).replace(" ", "")
+    if len(hx) != 16:
+        return None
+    return int.from_bytes(bytes.fromhex(hx), "little")
+
+
+def path_from_hit(bpname, regs):
+    """从命中时的寄存器里取出被打开的文件路径。
+
+    CreateFileW(lpFileName, ...)               → rcx 是 UTF-16 路径
+    NtCreateFile(..., POBJECT_ATTRIBUTES, ...) → r8 是 OBJECT_ATTRIBUTES*，
+        其中 ObjectName 在 +0x10；UNICODE_STRING 的 Buffer 在 +0x8、Length(字节) 在 +0x0。
+    """
+    if bpname.endswith("CreateFileW"):
+        p = as_int(regs.get("rcx", 0))
+        s, _nb, _note = read_wstr(p)
+        return s
+    if bpname.endswith("NtCreateFile"):
+        oa = as_int(regs.get("r8", 0))
+        us = read_u64(oa + 0x10)
+        if not us:
+            return None
+        ln = read_u64(us)          # 低 2 字节是 Length（字节数）
+        buf = read_u64(us + 0x8)
+        if not buf:
+            return None
+        n = (ln & 0xFFFF) if ln else 0x200
+        n = max(2, min(n, 0x400))
+        m = call("read_mem", {"addr": buf, "len": n}).get("result", {})
+        hx = str(m.get("hex", "")).replace(" ", "")
+        if not hx:
+            return None
+        return bytes.fromhex(hx).decode("utf-16-le", errors="replace")
+    return None
+
+
 def main():
     secs = 40.0
     if "--secs" in sys.argv:
         secs = float(sys.argv[sys.argv.index("--secs") + 1])
+    # 轮询间隔同时**就是**目标每次命中断点后被停住的时长 —— 所以它直接决定插桩的扰动大小。
+    # 默认 1.5 秒太粗：文件访问可能几十次，每次停 1.5 秒足以让目标的行为整个变形。
+    poll = 1.5
+    if "--poll" in sys.argv:
+        poll = float(sys.argv[sys.argv.index("--poll") + 1])
 
     switches = {k: v for k, v in os.environ.items()
                 if k.startswith("GUADBG_SKIP_")}
@@ -254,19 +297,56 @@ def main():
                     print("    硬件执行断点 %s!%s @ %#x -> %s"
                           % (mod, nm, a, "id=%s" % r.get("id") if r.get("id") is not None
                              else "**失败: %s**" % r.get("error")))
+
+        # --hw-file：抓**输入** —— 它到底在读哪些文件。
+        #
+        # 动机：第 145 轮拿到了它"说什么"（那句解密后的原文，堆上拼出来的），但那只是结论。
+        # 要知道它在查什么，就得看它**读了什么**：若在校验磁盘文件，就会看到一串打开路径，
+        # 以及"哪一个之后紧接着弹了框"；若一个文件都没开，那它校验的是内存/映像 —— 同样是收获。
+        bpname = {}
+        if "--hw-file" in sys.argv:
+            if not mods:
+                mods = call("list_modules").get("result", {}).get("modules", []) or []
+            for mod, nm in (("kernelbase.dll", "CreateFileW"),
+                            ("ntdll.dll", "NtCreateFile")):
+                ex = call("exports", {"module": mod}).get("result", {})
+                byname = {str(e.get("name", "")): e for e in (ex.get("exports") or [])
+                          if e.get("name")}
+                e = byname.get(nm)
+                if not e:
+                    print("    %s 没有导出 %s" % (mod, nm))
+                    continue
+                a = as_int(e.get("addr", e.get("address", 0)))
+                r = call("set_hw_bp", {"addr": a, "size": 1, "mode": "execute"}).get("result", {})
+                print("    硬件执行断点 %s!%s @ %#x -> %s"
+                      % (mod, nm, a, "id=%s" % r.get("id") if r.get("id") is not None
+                         else "**失败: %s**" % r.get("error")))
+                if r.get("id") is not None:
+                    bpname[a] = "%s!%s" % (mod, nm)
         call("resume")
 
         t0 = time.time()
         first = None
         seen = None
         while time.time() - t0 < secs:
-            time.sleep(1.5)
+            time.sleep(poll)
             # 先看是不是命中了我们挂的断点（命中时引擎会停在 paused）
             st2 = call("get_state").get("result", {})
             if st2.get("state") == "paused":
                 rip = st2.get("rip", 0)
                 reason = str(st2.get("reason", ""))[:70]
                 regs = call("get_regs").get("result", {}).get("regs", {}) or {}
+                if rip in bpname:
+                    # 文件访问断点：记下路径就继续，不走下面 MessageBox 那套
+                    pth = path_from_hit(bpname[rip], regs)
+                    if pth:
+                        tr = result.setdefault("file_trace", [])
+                        if (not tr or tr[-1] != pth) and len(tr) < 200:
+                            tr.append(pth)
+                            print("    %5.2f 秒: %-26s %s"
+                                  % (time.time() - t0, bpname[rip], pth[:150]))
+                    call("resume")
+                    continue
                 ins = call("disasm", {"addr": rip, "count": 3}).get("result", {}).get("lines", [])
                 print("    %5.1f 秒: **命中断点** rip=%#x reason=%s"
                       % (time.time() - t0, rip, reason))
