@@ -651,7 +651,22 @@ def main():
         # 用途（第 169 轮）：正常加载里 Sky.exe 的 `.data+0x3bd7b0` 是 **1**，我们这边是 **0**；
         # 而 0 会让 CRT 分配包装走 `mov edi, 8` 那一支 ⇒ `EnterCriticalSection((CS*)8)`
         # ⇒ `lock btr [rdi+8]` 写 0x10 ⇒ 崩。把这一字节补成 1，就能**因果地**验证
-        # 这个 AV 到底是不是"那一步初始化没跑"造成的。
+        # 那个 AV 到底是不是"那一步初始化没跑"造成的。
+        #
+        # **时机很重要（第 178 轮实测）**：同样的三个值，如果在**映射时**写（引擎那边做），
+        # 会被随后清零 —— 崩溃照旧（info2=0x10）；只有在**入口暂停之后、放行之前**写才有效。
+        # 所以这个开关的正确落点就在**这里**。
+        #
+        # GUADBG_SKY_INIT=1 时，自动补上这三处（默认不补）：
+        #   .data+0x3bd7b0 ← 01
+        #   .data+0x3bd780 ← 0000000000000000ffffffffffffffff
+        #   .data+0x3bd7d0 ← 0100008000000000
+        if os.environ.get("GUADBG_SKY_INIT", "0") not in ("", "0"):
+            for a_s, hx in (("0x1424e97b0", "01"),
+                            ("0x1424e9780", "0000000000000000ffffffffffffffff"),
+                            ("0x1424e97d0", "0100008000000000")):
+                sys.argv += ["--write-at", "%s:%s" % (a_s, hx)]
+            print("  [GUADBG_SKY_INIT=1] 自动补三处初值（入口暂停时写）")
         for i, a0 in enumerate(sys.argv):
             if a0 != "--write-at" or i + 1 >= len(sys.argv):
                 continue

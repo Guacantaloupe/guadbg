@@ -4523,6 +4523,69 @@ int main(int argc, char** argv) {
     logf("[*] 目标已映射: base=%p ep=%p size=0x%lx（入口点尚未运行）\n",
          target_base, ep, nt->OptionalHeader.SizeOfImage);
 
+    // ---- 1b2. GUADBG_SKY_INIT：把"已知必须补齐的那一簇初值"写进去（**默认关**） ----
+    //
+    // 为什么需要（第 169~177 轮的结论）：
+    //   正常加载里 Sky.exe 的 .data+0x3bd7b0 = 1、+0x3bd780 = 0/0xffffffffffffffff、
+    //   +0x3bd7d0 = 0x80000001；而在我们的寄生宿主里这三处**从来没被写过**
+    //   （硬件写断点零命中），于是 CRT 分配包装走 `mov edi, 8` 那一支 ⇒
+    //   EnterCriticalSection((CS*)8) ⇒ `lock btr [rdi+8]` 访问 0x10 ⇒ 崩。
+    //   文件里也没有任何代码写这一簇（第 158 轮 --wrefs 给 0 处写；第 177 轮把窗口 0x1424e9700..0x1424e9900
+    //   的 105 处引用全看了一遍，都是读形状）。写者只能在 .sky（静态扫描在那里不可信）里 ⇒
+    //   与其继续找它，不如**把状态做对**：把这三处初值固化成一个开关，
+    //   让后续实验都从"已经跨过这道缺口"的状态开始，而不是每回手敲三遍 --write-at。
+    //
+    // **默认关**：未验证的改动绝不进默认路径（本项目一直守的规矩）。
+    // **写失败必须大声报错**：绝不能让实验在"以为补了"的状态下继续。
+    {
+        char* env_sky_init = nullptr;
+        size_t env_len = 0;
+        if (_dupenv_s(&env_sky_init, &env_len, "GUADBG_SKY_INIT") == 0 && env_sky_init &&
+            env_sky_init[0] && strcmp(env_sky_init, "0") != 0) {
+            struct SkyInit { DWORD rva; const char* hex; size_t len; const char* what; };
+            static const SkyInit kSkyInit[] = {
+                { 0x03bd7b0u, "01", 1, "锁开关字节（0 会让 CRT 走 mov edi,8 那一支）" },
+                { 0x03bd780u, "0000000000000000ffffffffffffffff", 16, "锁/统计对象" },
+                { 0x03bd7d0u, "0100008000000000", 8, "计数器" },
+            };
+            logf("[*] GUADBG_SKY_INIT=%s：写入已知必须补齐的初值\n", env_sky_init);
+            int bad = 0;
+            for (size_t k = 0; k < sizeof(kSkyInit) / sizeof(kSkyInit[0]); k++) {
+                const SkyInit& e = kSkyInit[k];
+                BYTE bytes[16];
+                for (size_t i = 0; i < e.len; i++) {
+                    int hi = 0, lo = 0;
+                    for (int pass = 0; pass < 2; pass++) {
+                        char c = e.hex[i * 2 + pass];
+                        int v = (c >= '0' && c <= '9') ? (c - '0')
+                              : (c >= 'a' && c <= 'f') ? (c - 'a' + 10)
+                              : (c >= 'A' && c <= 'F') ? (c - 'A' + 10) : -1;
+                        if (pass == 0) hi = v; else lo = v;
+                    }
+                    bytes[i] = (BYTE)((hi << 4) | lo);
+                }
+                BYTE* p = (BYTE*)target_base + e.rva;
+                DWORD oldp = 0;
+                if (!VirtualProtect(p, e.len, PAGE_READWRITE, &oldp)) {
+                    logf("[!] GUADBG_SKY_INIT：VirtualProtect 失败 @ %p err=%lu"
+                         " —— **这一处没写成，别把本次实验当成「已补」**\n", p, GetLastError());
+                    bad++;
+                    continue;
+                }
+                memcpy(p, bytes, e.len);
+                DWORD dummy = 0;
+                VirtualProtect(p, e.len, oldp, &dummy);
+                FlushInstructionCache(GetCurrentProcess(), p, e.len);
+                logf("    %s @ %p（%zu 字节）← %s\n", e.what, p, e.len, e.hex);
+            }
+            if (bad)
+                logf("[!] GUADBG_SKY_INIT：有 %d 处没写成 —— **本次运行的结论不可用**\n", bad);
+            else
+                logf("[*] GUADBG_SKY_INIT：三处全部写好\n");
+            free(env_sky_init);
+        }
+    }
+
     // ---- 1c. 把目标的目录加进 DLL 搜索路径 ----
     //
     // 这一步是实测需要的，而且是这个工具跑真实游戏时**唯一**挡路的东西：
