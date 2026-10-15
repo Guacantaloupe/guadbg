@@ -587,6 +587,41 @@ def main():
                 print("    日志型断点 @ %#x **失败: %s**" % (a, r.get("error")))
                 problems.append("set_bp(log) 失败 @ %#x: %s" % (a, r.get("error")))
 
+        # --read-at-mod <模块名>+<RVA>[:<长度>]（可重复）：读**模块内**的地址。
+        #
+        # 为什么需要：引擎自己的全局在它的 .data 里（RVA 形式，静态可算），
+        # 但运行时整个模块被 ASLR 挪走（例如基址 0x7ff7079e0000），绝对地址必须**当场算**。
+        # 第 167 轮定位到：引擎 HeapFree 包装第一条指令是
+        # `mov rcx, qword ptr [rip + 0x159487a]` ⇒ 全局在引擎 RVA **0x15b9d90**。
+        for i, a0 in enumerate(sys.argv):
+            if a0 != "--read-at-mod" or i + 1 >= len(sys.argv):
+                continue
+            spec = sys.argv[i + 1]
+            if spec.startswith("--"):
+                continue
+            core, _c, l_s = spec.partition(":")
+            modname, _p, rva_s = core.partition("+")
+            if not _p:
+                print("    **--read-at-mod 需要『模块名+RVA』格式，收到 %r**" % spec)
+                problems.append("--read-at-mod 格式错: %r" % spec)
+                continue
+            if not mods:
+                mods = call("list_modules").get("result", {}).get("modules", []) or []
+            basev = None
+            for mo in mods:
+                if str(mo.get("name", "")).lower() == modname.lower():
+                    basev = as_int(mo.get("base", 0))
+                    break
+            ln = int(l_s, 0) if l_s else 8
+            if basev is None:
+                print("    **--read-at-mod 找不到模块 %r（现有: %s）**"
+                      % (modname, ", ".join(str(m.get("name")) for m in mods[:6])))
+                problems.append("--read-at-mod 找不到模块 %r" % modname)
+                continue
+            va = basev + int(rva_s, 0)
+            print("    --read-at-mod %s+%s → 运行期 %#x（模块基址 %#x）" % (modname, rva_s, va, basev))
+            read_at.append((va, ln))
+
         # --manual-pause：**对照实验** —— 不用任何断点，只像陷阱那样把目标停一小会儿。
         #
         # 目的：把"挂住那次 CreateFileW 之后对话框就不出现"的两种解释分开：
