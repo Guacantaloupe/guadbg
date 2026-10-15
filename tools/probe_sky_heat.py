@@ -122,6 +122,27 @@ def main():
                 print("    - %s" % p)
             return 1
 
+        # --write-at <地址>:<十六进制>（可重复）：入口暂停时先写内存再放行（走引擎 write_mem）。
+        #
+        # 用途（第 171 轮）：第 170 轮发现，把正常加载里的三个初值补上之后目标 22 秒不再崩。
+        # 这里要回答的是"**它是不是在推进**" —— 而本项目衡量推进的老办法就是
+        # 「`.text` / `.sky` 的页面到底有没有被访问」（当年卡在对话框时是**零访问**）。
+        # 所以热力图工具必须也能补那三个值，否则测的还是"崩不崩"，不是"走不走"。
+        for i, a0 in enumerate(sys.argv):
+            if a0 != "--write-at" or i + 1 >= len(sys.argv):
+                continue
+            spec = sys.argv[i + 1]
+            if spec.startswith("--"):
+                continue
+            a_s, _c, hx = spec.partition(":")
+            r = call("write_mem", {"addr": int(a_s, 0), "hex": hx}).get("result", {})
+            ok = r.get("ok")
+            print("    **写入** %s ← %s → %s"
+                  % (a_s, hx, ("ok，%s 字节" % r.get("written")) if ok
+                     else "**失败: %s**" % r.get("error")))
+            if not ok:
+                problems.append("write_mem 失败 @ %s: %s" % (a_s, r.get("error")))
+
         print("  让它跑 %.0f 秒…" % secs)
         call("resume")
         t0 = time.time()
