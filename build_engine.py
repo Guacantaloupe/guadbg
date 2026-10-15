@@ -91,7 +91,13 @@ def main():
     libdirs = [p for p in libdirs if os.path.isdir(p)]
 
     env = dict(os.environ)
-    env["PATH"] = os.path.dirname(cl) + os.pathsep + env.get("PATH", "")
+    # 第 193 轮：SDK 的 bin 目录也要进 PATH —— 链接器在嵌入应用清单时要调用 **mt.exe**，
+    # 以前只把 MSVC 的 bin 加进 PATH，于是 /MANIFEST:EMBED 直接失败：
+    #     LINK : fatal error LNK1158: 无法运行"mt.exe"
+    sdk_bin = os.path.join(sdk, "bin", sdkver, "x64")
+    env["PATH"] = (os.path.dirname(cl) + os.pathsep
+                   + ((sdk_bin + os.pathsep) if os.path.isdir(sdk_bin) else "")
+                   + env.get("PATH", ""))
     env["INCLUDE"] = os.pathsep.join(incdirs)
     env["LIB"] = os.pathsep.join(libdirs)
 
@@ -108,6 +114,18 @@ def main():
                "/Fe" + os.path.join(ROOT, out)]
         cmd += [os.path.join(ROOT, s) for s in srcs]
         cmd += libs
+        # 第 193 轮：把应用清单**嵌进 exe**。
+        #
+        # 为什么必须：引擎是把目标映像映射进自己进程的，目标里所有版本 API 看到的都是
+        # **宿主进程**的版本行为；而"没有清单"的进程会被 Windows 套上兼容性垫片，
+        # 报告 6.2.9200（Windows 8）—— 于是 Sky.exe 弹
+        # 「Minimum supported Windows 10.0.18362 … Windows 6.2.9200 detected.」并拒绝继续。
+        # 声明 supportedOS（清单里已写）之后宿主报告真实版本，这道坎就没了。
+        mf = os.path.join(ROOT, "guadbg.manifest")
+        if os.path.exists(mf):
+            cmd += ["/link", "/MANIFEST:EMBED", "/MANIFESTINPUT:" + mf]
+        else:
+            print("  [!] 没找到 guadbg.manifest —— 目标会因为「Windows 6.2.9200」拒绝运行")
         print()
         print("  === 构建 %s ===" % out)
         r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True)
