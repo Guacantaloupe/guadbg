@@ -3026,6 +3026,14 @@ static LONG NTAPI gua_veh(PEXCEPTION_POINTERS ep) {
             (unsigned long long)ep->ContextRecord->Rcx, (unsigned long long)ep->ContextRecord->Rdx,
             (unsigned long long)ep->ContextRecord->Rsi, (unsigned long long)ep->ContextRecord->Rdi,
             (unsigned long long)ep->ContextRecord->Rsp, (unsigned long long)ep->ContextRecord->Rbp);
+        // 第 201 轮补上 r8~r15：很多崩点的问题指针在 r14/r15 里（例如
+        // `mov r15, [rax + r14*8]` 取出 0 ⇒ 后面拿 r15 当指针就崩），
+        // 只记 rax..rbp 看不到"是谁给 r15 赋的值、索引是多少"。
+        logf("[!]   现场 r8~r15: r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
+            (unsigned long long)ep->ContextRecord->R8, (unsigned long long)ep->ContextRecord->R9,
+            (unsigned long long)ep->ContextRecord->R10, (unsigned long long)ep->ContextRecord->R11,
+            (unsigned long long)ep->ContextRecord->R12, (unsigned long long)ep->ContextRecord->R13,
+            (unsigned long long)ep->ContextRecord->R14, (unsigned long long)ep->ContextRecord->R15);
         char reason[192];
         sprintf_s(reason, "异常 0x%08X @ 0x%llx", code,
             (unsigned long long)ep->ExceptionRecord->ExceptionAddress);
