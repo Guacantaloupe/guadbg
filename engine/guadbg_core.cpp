@@ -4346,6 +4346,26 @@ static PFN_GetModuleFileNameW g_real_gmfnw = NULL;
 static PFN_GetModuleFileNameA g_real_gmfna = NULL;
 static int g_gmfn_logged = 0;
 
+// 「等到保护层问完映像路径，再开始跟踪，并在 RIP 进入指定区间时停下」。
+//
+// 为什么要这样：从入口就开跟踪（mode=into，逐指令单步 + VEH 往返）**太慢** ——
+// 第 152 轮试过，30 秒都没走到 `.text`（而正常执行 2.3 秒就到了）。
+// 但保护层在跳进真代码之前一定会问映像路径（第 148 轮量到两次 GetModuleFileNameW），
+// 所以在那之后开跟踪，窗口就短得多。
+// 区间由环境变量 GUADBG_TRACE_RANGE=lo:hi 给（十六进制），便于复用。
+static ULONG_PTR g_tr_lo = 0, g_tr_hi = 0;
+
+static void arm_trace_on_range(void) {
+    if (!g_tr_lo || !g_tr_hi) return;
+    _snprintf_s(g_trace_cond, sizeof(g_trace_cond), _TRUNCATE,
+                "rip >= %#llx && rip < %#llx",
+                (unsigned long long)g_tr_lo, (unsigned long long)g_tr_hi);
+    g_trace_mode = 0;      // into
+    g_trace_max = 0;       // 不限条数
+    g_trace_on = 1;
+    logf("[i] 已在保护层问过路径之后启动跟踪，条件: %s\n", g_trace_cond);
+}
+
 // 目标映像里**可执行的段**（本目标就是两个 .sky）。用来判断"这次调用是谁发的"。
 // 第 149 轮量到：GetModuleFileNameW 的调用者里，两个来自保护层（.sky），
 // 第三个来自 **.text 里的游戏真代码** —— 而当时钩子对**所有**调用者都答目标路径，
@@ -4369,6 +4389,8 @@ static DWORD WINAPI hk_getmodulefilenamew(HMODULE hModule, LPWSTR lpFilename, DW
             logf("[i] GetModuleFileNameW(NULL) -> 目标路径（第 %d 次）caller=%p\n",
                  g_gmfn_logged, _ReturnAddress());
         }
+        // 保护层问过两次之后就该跳进真代码了：这时候开跟踪
+        if (g_gmfn_logged >= 2 && g_tr_lo && !g_trace_on) arm_trace_on_range();
         if (n + 1 > nSize) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return nSize; }
         memcpy(lpFilename, g_target_path, (n + 1) * sizeof(WCHAR));
         return (DWORD)n;
@@ -4426,6 +4448,19 @@ static int env_on(const char* name) {
     char buf[8] = { 0 };
     DWORD n = GetEnvironmentVariableA(name, buf, (DWORD)sizeof(buf));
     return n > 0 && buf[0] != '0';
+}
+
+// GUADBG_TRACE_RANGE=lo:hi（十六进制）—— 见 arm_trace_on_range 的注释
+static void read_trace_range_env(void) {
+    char buf[128] = { 0 };
+    if (!GetEnvironmentVariableA("GUADBG_TRACE_RANGE", buf, (DWORD)sizeof(buf))) return;
+    char* colon = strchr(buf, ':');
+    if (!colon) { logf("[!] GUADBG_TRACE_RANGE 格式应为 lo:hi\n"); return; }
+    *colon = 0;
+    g_tr_lo = (ULONG_PTR)_strtoui64(buf, NULL, 16);
+    g_tr_hi = (ULONG_PTR)_strtoui64(colon + 1, NULL, 16);
+    logf("[*] 跟踪停止区间: %#llx .. %#llx（保护层问过路径后启用）\n",
+         (unsigned long long)g_tr_lo, (unsigned long long)g_tr_hi);
 }
 
 int main(int argc, char** argv) {
@@ -4648,6 +4683,8 @@ int main(int argc, char** argv) {
     if (env_on("GUADBG_SKIP_HOOK")) {
         logf("[!] GUADBG_SKIP_HOOK：跳过 kernel32 钩子（诊断用）\n");
     } else {
+    read_trace_range_env();   // GUADBG_TRACE_RANGE（诊断用）
+
     // 记下**保护层**的段区间（名字以 .sky 开头）—— 供 GetModuleFileName* 钩子按调用者过滤用。
     //
     // 第 149 轮第一次过滤写错了：我按"可执行段"过滤，而 .text 也是目标的**可执行段**，
